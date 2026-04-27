@@ -1,0 +1,15 @@
+{
+	"name": "EZProfileStore-Dev",
+	"tree": {
+		"$className": "DataModel",
+		"ServerScriptService": {
+			"$className": "ServerScriptService",
+			"EZProfileStore": {
+				"$path": "src"
+			},
+			"Packages": {
+				"$path": "Packages"
+			}
+		}
+	}
+}
