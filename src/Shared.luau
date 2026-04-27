@@ -3,9 +3,9 @@
 	@class Shared
 	@private
 
-	Internal utilities shared between the Server and Client modules:
-	key-path resolution, path read/write helpers, and the well-known
-	remote names used to wire up replication.
+	Internal helpers shared between [Server] and [Client]: key-path
+	resolution, path read/write utilities, and the names used to wire up
+	the replication remotes.
 ]=]
 
 local Shared = {}
@@ -17,13 +17,9 @@ Shared.REMOTE_REQUEST_DATA = "RequestData"
 export type KeyPath = string | { string }
 
 -- Wire-format tuple per replicated update:
---   `{ pathString }`              → delete the key (value is nil)
---   `{ pathString, value }`       → set the value at that path
---   `{ pathString, value, true }` → table.insert `value` into the array at that path
---
--- A `Batch` is `{ Update, Update, ... }`. Sending positional tuples instead
--- of a `{ keyPath = ..., value = ..., isInsert = ... }` dictionary saves the
--- per-key serialization overhead Roblox pays on networked tables.
+--   { pathString }              → delete
+--   { pathString, value }       → set
+--   { pathString, value, true } → table.insert into array at path
 export type Update = { any }
 export type Batch = { Update }
 
@@ -35,12 +31,9 @@ local _pathCacheSize = 0
 
 --[=[
 	Resolves a `KeyPath` to its array form. String paths are split on `.` and
-	the result is cached so repeated `UpdateData(player, "Stats.XP", ...)` calls
-	don't reallocate. The cache is bounded — if it fills, it's dropped wholesale
-	rather than evicted entry-by-entry, which is fine because game key-paths are
-	overwhelmingly static.
+	cached. The returned array must be treated as read-only.
 
-	Callers must treat the returned array as read-only.
+	@private
 ]=]
 function Shared.resolveKeyPath(keyPath: KeyPath): { string }
 	if typeof(keyPath) == "string" then
@@ -67,9 +60,9 @@ function Shared.resolveKeyPath(keyPath: KeyPath): { string }
 end
 
 --[=[
-	Returns the canonical `.`-joined wire string for a `KeyPath`. String
-	keypaths are returned untouched (already in wire form); array keypaths
-	are concatenated.
+	Returns the canonical `.`-joined wire string for a `KeyPath`.
+
+	@private
 ]=]
 function Shared.toPathString(keyPath: KeyPath): string
 	if typeof(keyPath) == "string" then
@@ -79,8 +72,9 @@ function Shared.toPathString(keyPath: KeyPath): string
 end
 
 --[=[
-	Reads the value at a path. Returns nil if any segment doesn't resolve
-	or the path passes through a non-table.
+	Reads the value at `path`. Returns `nil` if any segment fails to resolve.
+
+	@private
 ]=]
 function Shared.readPath(data: any, path: { string }): any
 	local current: any = data
@@ -94,13 +88,13 @@ function Shared.readPath(data: any, path: { string }): any
 end
 
 --[=[
-	Mutates `root` in place. Walks `path[1..#-1]`, materializing missing
-	intermediate tables, then writes (or inserts) at `path[#path]`.
+	Mutates `root` in place, materializing missing intermediate tables.
+	Returns `true` only when a real change is made:
+	- set: `false` if the target already equals `value`.
+	- insert: `false` if the target is not a table.
+	- empty path: always `false`.
 
-	Returns true if a real change was made:
-	- Non-insert: false if `target[finalKey]` already equals `value`.
-	- Insert: false if the target isn't a table (no-op).
-	- Empty path: always false.
+	@private
 ]=]
 function Shared.writePath(root: any, path: { string }, value: any, isInsert: boolean): boolean
 	if #path == 0 then
@@ -134,9 +128,10 @@ end
 
 --[=[
 	Returns a new root with the spine along `path` shallow-cloned and the
-	value written at the leaf. Sibling subtrees keep reference identity, so
-	downstream Fusion observers only re-evaluate along the changed spine —
-	avoids deep-cloning the entire profile on every replicated update.
+	value written at the leaf. Sibling subtrees keep reference identity so
+	Fusion observers only re-evaluate along the changed spine.
+
+	@private
 ]=]
 function Shared.writePathSpine<T>(root: T, path: { string }, value: any, isInsert: boolean): T
 	if #path == 0 then

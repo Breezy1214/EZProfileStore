@@ -3,10 +3,7 @@
 	@class Server
 	@server
 
-	Server-side profile lifecycle + automatic client replication using raw
-	RemoteEvents.
-
-	Usage:
+	Manages player profile sessions and replicates updates to connected clients.
 
 	```luau
 	local EZProfileStore = require(Path.To.EZProfileStore)
@@ -20,10 +17,50 @@
 		print(player.Name, "loaded")
 	end)
 
-	store:UpdateData(somePlayer, "Coins", 100)
-	store:UpdateData(somePlayer, { "Inventory", "SwordOfTruth" }, true)
-	store:InsertData(somePlayer, "Inventory", "Potion") -- appends to Inventory
+	store:UpdateData(player, "Coins", 100)
+	store:UpdateData(player, { "Inventory", "SwordOfTruth" }, true)
+	store:InsertData(player, "Inventory", "Potion")
 	```
+]=]
+
+--[=[
+	@interface Config
+	@within Server
+	.storeName string -- Name passed to `ProfileStore.New`.
+	.template { [any]: any } -- Default profile data for new players.
+	.keyPrefix string? -- Profile key prefix. Defaults to `"Player_"`.
+	.useMockInStudio boolean? -- Use the mock store when running in Studio.
+	.remoteParent Instance? -- Parent for the replication folder. Defaults to `ReplicatedStorage`.
+]=]
+
+--[=[
+	@prop ProfileLoaded Signal<Player, Profile>
+	@within Server
+
+	Fires after a player's profile loads successfully.
+]=]
+
+--[=[
+	@prop ProfileReleased Signal<Player>
+	@within Server
+
+	Fires when a player's profile session ends.
+]=]
+
+--[=[
+	@prop FirstJoin Signal<Player, { [any]: any }>
+	@within Server
+
+	Fires the first time a player loads a profile in this store. The data
+	table is the freshly reconciled profile data and may be mutated
+	synchronously to seed defaults.
+]=]
+
+--[=[
+	@prop DataUpdated Signal<Player, KeyPath, any>
+	@within Server
+
+	Fires after a successful `UpdateData` or `InsertData` call.
 ]=]
 
 local Players = game:GetService("Players")
@@ -92,12 +129,13 @@ local function ensureRemoteFolder(remoteParent: Instance): Folder
 end
 
 --[=[
-	Creates a new server-side store. Auto-binds `Players.PlayerAdded` and
-	`Players.PlayerRemoving`, picks up players already in the server, and
-	provisions the replication remotes under `ReplicatedStorage._EZProfileStore`
-	(or under `config.remoteParent` if supplied).
+	Creates a new server-side store. Binds player join/leave handlers,
+	processes players already in the server, and provisions the replication
+	remotes under `config.remoteParent` (defaults to `ReplicatedStorage`).
 
 	@within Server
+	@param config Config
+	@return Server
 ]=]
 function Server.new(config: Config): Server
 	assert(typeof(config) == "table", "Server.new expects a config table")
@@ -252,8 +290,7 @@ function Server._queueUpdate(self: Server, player: Player, pathStr: string, valu
 			local entry = batch[i]
 			if entry[1] == pathStr then
 				if entry[3] == true then
-					-- An insert to the same path sits between this set and any
-					-- earlier set; coalescing past it would reorder ops.
+					-- Don't coalesce past an insert — would reorder ops.
 					break
 				end
 				entry[2] = value
@@ -296,24 +333,30 @@ function Server._flushUpdates(self: Server)
 end
 
 --[=[
-	Returns the underlying ProfileStore profile, or nil if the profile hasn't
-	loaded yet.
+	Returns the underlying ProfileStore profile for `player`, or `nil` if no
+	profile has loaded.
 
 	@within Server
+	@method GetProfile
+	@param player Player
+	@return Profile?
 ]=]
 function Server.GetProfile(self: Server, player: Player): Profile?
 	return self._profiles[player]
 end
 
 --[=[
-	Returns the player's data table (a reference into profile.Data), or nil
-	if the profile hasn't loaded yet.
+	Returns the player's data table by reference, or `nil` if no profile has
+	loaded.
 
-	Mutating this table directly persists on the next save but does NOT
-	replicate to the client. Use `UpdateData` for changes that should
-	replicate.
+	Direct mutations persist on the next save but do **not** replicate to the
+	client. Use [Server:UpdateData] or [Server:InsertData] for replicated
+	changes.
 
 	@within Server
+	@method GetData
+	@param player Player
+	@return { [any]: any }?
 ]=]
 function Server.GetData(self: Server, player: Player): { [any]: any }?
 	local profile = self._profiles[player]
@@ -321,10 +364,14 @@ function Server.GetData(self: Server, player: Player): { [any]: any }?
 end
 
 --[=[
-	Reads a value at a key path without mutating. Returns nil if the path
-	doesn't resolve.
+	Reads the value at `keyPath`. Returns `nil` if the path does not resolve
+	or the profile has not loaded.
 
 	@within Server
+	@method ReadData
+	@param player Player
+	@param keyPath KeyPath -- Dot-notation string or array of segments.
+	@return any
 ]=]
 function Server.ReadData(self: Server, player: Player, keyPath: Shared.KeyPath): any
 	local data = self:GetData(player)
@@ -335,15 +382,19 @@ function Server.ReadData(self: Server, player: Player, keyPath: Shared.KeyPath):
 end
 
 --[=[
-	Sets a value at a key path. Accepts dot-notation strings (`"Currency.Coins"`)
-	or array paths (`{ "Currency", "Coins" }`).
+	Sets a value at `keyPath`. Accepts dot-notation strings
+	(`"Currency.Coins"`) or array paths (`{ "Currency", "Coins" }`).
 
-	Returns true if the value was actually changed, false if it was already
-	equal. Replication and `DataUpdated` only fire on real changes. Replication
-	is deferred until the end of the current resumption — synchronous bursts of
-	writes are coalesced into a single network fire.
+	Replication and the [Server.DataUpdated] signal only fire when the value
+	actually changes. Replication is deferred to the end of the current frame,
+	so synchronous bursts of writes are coalesced into a single network event.
 
 	@within Server
+	@method UpdateData
+	@param player Player
+	@param keyPath KeyPath
+	@param value any
+	@return boolean -- `true` if the value changed, `false` otherwise.
 ]=]
 function Server.UpdateData(self: Server, player: Player, keyPath: Shared.KeyPath, value: any): boolean
 	local data = self:GetData(player)
@@ -362,11 +413,15 @@ function Server.UpdateData(self: Server, player: Player, keyPath: Shared.KeyPath
 end
 
 --[=[
-	Appends `value` to the array at `keyPath` via `table.insert`. The target
-	must already be a table; if it isn't, this warns and returns false
-	without firing replication.
+	Appends `value` to the array at `keyPath`. The target must be a table; if
+	it isn't, this warns and returns `false` without replicating.
 
 	@within Server
+	@method InsertData
+	@param player Player
+	@param keyPath KeyPath
+	@param value any
+	@return boolean -- `true` on success, `false` if the target is not a table.
 ]=]
 function Server.InsertData(self: Server, player: Player, keyPath: Shared.KeyPath, value: any): boolean
 	local data = self:GetData(player)
@@ -386,11 +441,11 @@ function Server.InsertData(self: Server, player: Player, keyPath: Shared.KeyPath
 end
 
 --[=[
-	Releases all sessions, disconnects player listeners, and cleans up
-	signals. The replication remotes under ReplicatedStorage are left in
-	place so the client side does not break if you re-create the store.
+	Ends all active profile sessions, disconnects player listeners, and
+	releases signals. The replication remotes are not removed.
 
 	@within Server
+	@method Destroy
 ]=]
 function Server.Destroy(self: Server)
 	if self._isDestroyed then

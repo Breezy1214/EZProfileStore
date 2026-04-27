@@ -3,16 +3,12 @@
 	@class Client
 	@client
 
-	Client-side mirror of the player's profile, kept in sync via the remotes
-	provisioned by `Server.new`. Maintains a Fusion-backed copy of
-	`profile.Data`, queues updates that arrive before the initial payload, and
-	exposes path watchers via the existing `breezy1214/pathwatcher` package.
+	Mirrors the player's profile in a Fusion state object and exposes
+	path-based observers.
 
-	`client.Ready` is an `evaera/promise` Promise that resolves once with the
-	initial snapshot — chain off it directly, or use `OnReady` / `GetDataAsync`
-	for callback / yielding wrappers.
-
-	Usage:
+	[Client.Ready](#Ready) is a Promise that resolves with the initial
+	snapshot. Use [Client:OnReady] or [Client:GetDataAsync] as callback or
+	yielding alternatives.
 
 	```luau
 	local EZProfileStore = require(Path.To.EZProfileStore)
@@ -23,20 +19,41 @@
 		print("Initial coins:", data.Coins)
 	end)
 
-	-- Long-lived watcher backed by PathWatcher:
 	local coinsWatcher = client:WatchPath("Coins")
 	coinsWatcher:onChange(function(newValue, oldValue)
 		print("Coins:", oldValue, "->", newValue)
 	end)
 
-	-- Or one-shot subscribe:
 	local disconnect = client:OnChanged("Inventory", function(newValue)
 		print("Inventory changed:", newValue)
 	end)
 
-	-- Snapshot reads:
 	local coins = client:Read("Coins")
 	```
+]=]
+
+--[=[
+	@interface Config
+	@within Client
+	.remoteParent Instance? -- Parent of the replication folder. Defaults to `ReplicatedStorage`.
+	.waitTimeout number? -- Seconds to wait for the replication remotes. Defaults to `30`.
+]=]
+
+--[=[
+	@prop Ready Promise<{ [any]: any }>
+	@within Client
+
+	Resolves with the initial profile snapshot. Rejects if the client is
+	destroyed before the snapshot arrives.
+]=]
+
+--[=[
+	@prop Updated Signal<{ string }, any>
+	@within Client
+
+	Fires for each path/value pair applied from a server update. Path is the
+	resolved array form. Use [Client:WatchPath] or [Client:OnChanged] for
+	path-scoped subscriptions.
 ]=]
 
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
@@ -95,11 +112,12 @@ local function waitForChild(parent: Instance, name: string, className: string, t
 end
 
 --[=[
-	Connects to the replication remotes under `ReplicatedStorage._EZProfileStore`
-	(or `config.remoteParent` if provided), pulls the initial snapshot via
-	`RequestData`, and keeps the local Fusion mirror in sync.
+	Connects to the server's replication remotes, requests the initial
+	snapshot, and begins applying updates to the local Fusion mirror.
 
 	@within Client
+	@param config Config?
+	@return Client
 ]=]
 function Client.new(config: Config?): Client
 	assert(RunService:IsClient(), "EZProfileStore.Client can only be required on the client")
@@ -223,9 +241,7 @@ function Client._applyBatch(self: Client, batch: Shared.Batch, fireSignal: boole
 	end
 
 	local newData: any = current
-	-- Fire signals after `_dataValue:set` so handlers `peek`-ing the mirror
-	-- see the post-batch state, not a partial spine. Interleaved (path, value)
-	-- pairs avoid a wrapper table per entry.
+	-- Defer signal fires until after `_dataValue:set` so handlers see the post-batch state.
 	local toFire: { any }? = if fireSignal then table.create(#batch * 2) else nil
 
 	for _, entry in batch do
@@ -260,20 +276,24 @@ function Client._applyBatch(self: Client, batch: Shared.Batch, fireSignal: boole
 end
 
 --[=[
-	Returns the local snapshot, or nil if the initial payload hasn't arrived
-	yet. Read freely; do not mutate.
+	Returns the local snapshot, or `nil` if the initial payload has not
+	arrived. The returned table is read-only; do not mutate.
 
 	@within Client
+	@method GetData
+	@return { [any]: any }?
 ]=]
 function Client.GetData(self: Client): { [any]: any }?
 	return Fusion.peek(self._dataValue)
 end
 
 --[=[
-	Returns the underlying Fusion.Value for direct binding into Computeds /
-	Hydrations elsewhere.
+	Returns the underlying `Fusion.Value` holding the snapshot. Bind it into
+	Computeds or hydrate UI directly.
 
 	@within Client
+	@method GetDataState
+	@return Fusion.Value<{ [any]: any }?>
 ]=]
 function Client.GetDataState(self: Client)
 	return self._dataValue
@@ -281,19 +301,26 @@ end
 
 --[=[
 	Yields until the initial payload arrives, then returns it. Errors after
-	`timeout` seconds (default 10).
+	`timeout` seconds.
 
 	@within Client
+	@method GetDataAsync
+	@yields
+	@param timeout number? -- Defaults to `10`.
+	@return { [any]: any }
 ]=]
 function Client.GetDataAsync(self: Client, timeout: number?): { [any]: any }
 	return self.Ready:timeout(timeout or 10):expect()
 end
 
 --[=[
-	Reads the value at a key path from the local snapshot. Returns nil if
-	the path doesn't resolve or the snapshot hasn't loaded yet.
+	Reads the value at `keyPath` from the local snapshot. Returns `nil` if
+	the path does not resolve or the snapshot has not loaded.
 
 	@within Client
+	@method Read
+	@param keyPath KeyPath -- Dot-notation string or array of segments.
+	@return any
 ]=]
 function Client.Read(self: Client, keyPath: Shared.KeyPath): any
 	local current = Fusion.peek(self._dataValue)
@@ -304,20 +331,24 @@ function Client.Read(self: Client, keyPath: Shared.KeyPath): any
 end
 
 --[=[
-	Returns true if the initial payload has been received.
+	Returns `true` once the initial payload has been received.
 
 	@within Client
+	@method IsReady
+	@return boolean
 ]=]
 function Client.IsReady(self: Client): boolean
 	return self.Ready:getStatus() == Promise.Status.Resolved
 end
 
 --[=[
-	Calls `callback` with the initial snapshot. If already loaded, the
-	callback runs on the next frame; otherwise it runs once when the
-	snapshot arrives. Returns a disconnect function.
+	Calls `callback` once with the initial snapshot. Runs on the next frame
+	if already loaded, otherwise when the snapshot arrives.
 
 	@within Client
+	@method OnReady
+	@param callback (data: { [any]: any }) -> ()
+	@return Disconnect
 ]=]
 function Client.OnReady(self: Client, callback: (data: { [any]: any }) -> ()): Disconnect
 	local chain = self.Ready:andThen(callback)
@@ -327,23 +358,28 @@ function Client.OnReady(self: Client, callback: (data: { [any]: any }) -> ()): D
 end
 
 --[=[
-	Returns a `PathWatcher` from `breezy1214/pathwatcher` bound to the
-	given key path on the local Fusion mirror. Use the watcher's `.Value`
-	in Fusion Computeds, or `:onChange(fn)` for callbacks. Call `:Destroy()`
-	on the watcher when done.
+	Returns a `PathWatcher` bound to `keyPath` on the local Fusion mirror.
+	Use the watcher's `.Value` inside Fusion Computeds or `:onChange(fn)` for
+	callbacks. Call `:Destroy()` on the watcher when finished.
 
 	@within Client
+	@method WatchPath
+	@param keyPath KeyPath
+	@return PathWatcher
 ]=]
 function Client.WatchPath(self: Client, keyPath: Shared.KeyPath): PathWatcher
 	return PathWatcher.new(self._dataValue :: any, keyPath)
 end
 
 --[=[
-	Convenience wrapper around `WatchPath`: subscribes `callback` to the
-	resulting watcher and returns a disconnect function that destroys the
-	watcher.
+	Subscribes `callback` to changes at `keyPath`. Returns a disconnect
+	function that destroys the underlying watcher.
 
 	@within Client
+	@method OnChanged
+	@param keyPath KeyPath
+	@param callback (newValue: any, oldValue: any) -> ()
+	@return Disconnect
 ]=]
 function Client.OnChanged(
 	self: Client,
@@ -358,10 +394,11 @@ function Client.OnChanged(
 end
 
 --[=[
-	Disconnects all listeners, cleans up the Fusion scope, and frees the
-	local mirror.
+	Disconnects listeners, cleans up the Fusion scope, and rejects
+	[Client.Ready](#Ready) if it has not yet resolved.
 
 	@within Client
+	@method Destroy
 ]=]
 function Client.Destroy(self: Client)
 	if self._isDestroyed then
