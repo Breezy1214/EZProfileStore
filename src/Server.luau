@@ -24,9 +24,6 @@
 	store:UpdateData(somePlayer, { "Inventory", "SwordOfTruth" }, true)
 	store:InsertData(somePlayer, "Inventory", "Potion") -- appends to Inventory
 	```
-
-	ProfileStore is bundled inside the package — no separate install or
-	server-only realm dance required.
 ]=]
 
 local Players = game:GetService("Players")
@@ -34,10 +31,12 @@ local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local RunService = game:GetService("RunService")
 
 local ProfileStore = require(script.Parent.Parent.ProfileStore)
+local Promise = require(script.Parent.Parent.Promise)
 local Shared = require(script.Parent.Shared)
 local Signal = require(script.Parent.Parent.Signal)
 
 local DEFAULT_KEY_PREFIX = "Player_"
+local SNAPSHOT_WAIT_TIMEOUT = 30
 
 export type Config = {
 	storeName: string,
@@ -55,10 +54,11 @@ export type Server = typeof(setmetatable(
 		_profiles: { [Player]: Profile },
 		_connections: { RBXScriptConnection },
 		_remoteFolder: Folder,
-		_dataInit: RemoteEvent,
 		_dataUpdate: RemoteEvent,
 		_requestData: RemoteFunction,
 		_isDestroyed: boolean,
+		_pendingBatches: { [Player]: Shared.Batch },
+		_flushScheduled: boolean,
 		ProfileLoaded: Signal.Signal<Player, Profile>,
 		ProfileReleased: Signal.Signal<Player>,
 		FirstJoin: Signal.Signal<Player, { [any]: any }>,
@@ -112,7 +112,6 @@ function Server.new(config: Config): Server
 
 	local remoteParent = config.remoteParent or ReplicatedStorage
 	local remoteFolder = ensureRemoteFolder(remoteParent)
-	local dataInit = ensureChild(remoteFolder, Shared.REMOTE_DATA_INIT, "RemoteEvent") :: RemoteEvent
 	local dataUpdate = ensureChild(remoteFolder, Shared.REMOTE_DATA_UPDATE, "RemoteEvent") :: RemoteEvent
 	local requestData = ensureChild(remoteFolder, Shared.REMOTE_REQUEST_DATA, "RemoteFunction") :: RemoteFunction
 
@@ -122,10 +121,11 @@ function Server.new(config: Config): Server
 		_profiles = {},
 		_connections = {},
 		_remoteFolder = remoteFolder,
-		_dataInit = dataInit,
 		_dataUpdate = dataUpdate,
 		_requestData = requestData,
 		_isDestroyed = false,
+		_pendingBatches = {},
+		_flushScheduled = false,
 		ProfileLoaded = Signal.new(),
 		ProfileReleased = Signal.new(),
 		FirstJoin = Signal.new(),
@@ -133,8 +133,7 @@ function Server.new(config: Config): Server
 	}, Server) :: any
 
 	requestData.OnServerInvoke = function(player: Player): { [any]: any }?
-		local profile = self._profiles[player]
-		return profile and profile.Data or nil
+		return self:_waitForData(player)
 	end
 
 	table.insert(
@@ -158,6 +157,30 @@ function Server.new(config: Config): Server
 	end
 
 	return self
+end
+
+function Server._waitForData(self: Server, player: Player): { [any]: any }?
+	if self._isDestroyed then
+		return nil
+	end
+
+	local profile = self._profiles[player]
+	if profile then
+		return profile.Data
+	end
+
+	local ok = Promise.fromEvent(self.ProfileLoaded, function(loadedPlayer)
+		return loadedPlayer == player
+	end)
+		:timeout(SNAPSHOT_WAIT_TIMEOUT)
+		:await()
+
+	if not ok or self._isDestroyed or player.Parent ~= Players then
+		return nil
+	end
+
+	profile = self._profiles[player]
+	return profile and profile.Data or nil
 end
 
 function Server._onPlayerAdded(self: Server, player: Player)
@@ -189,6 +212,7 @@ function Server._onPlayerAdded(self: Server, player: Player)
 
 	profile.OnSessionEnd:Connect(function()
 		self._profiles[player] = nil
+		self._pendingBatches[player] = nil
 		self.ProfileReleased:Fire(player)
 		if player.Parent == Players then
 			player:Kick("Profile session ended - please rejoin")
@@ -202,14 +226,73 @@ function Server._onPlayerAdded(self: Server, player: Player)
 	end
 
 	self.ProfileLoaded:Fire(player, profile)
-	self._dataInit:FireClient(player, profile.Data)
 end
 
 function Server._onPlayerRemoving(self: Server, player: Player)
+	self._pendingBatches[player] = nil
 	local profile = self._profiles[player]
 	if profile then
 		profile:EndSession()
 	end
+end
+
+function Server._queueUpdate(self: Server, player: Player, pathStr: string, value: any, isInsert: boolean)
+	local batch = self._pendingBatches[player]
+	if not batch then
+		batch = {}
+		self._pendingBatches[player] = batch
+	end
+
+	if isInsert then
+		local entry: Shared.Update = { pathStr, value, true }
+		table.insert(batch, entry)
+	else
+		local coalesced = false
+		for i = #batch, 1, -1 do
+			local entry = batch[i]
+			if entry[1] == pathStr then
+				if entry[3] == true then
+					-- An insert to the same path sits between this set and any
+					-- earlier set; coalescing past it would reorder ops.
+					break
+				end
+				entry[2] = value
+				coalesced = true
+				break
+			end
+		end
+		if not coalesced then
+			local entry: Shared.Update = if value == nil then { pathStr } else { pathStr, value }
+			table.insert(batch, entry)
+		end
+	end
+
+	self:_scheduleFlush()
+end
+
+function Server._scheduleFlush(self: Server)
+	if self._flushScheduled or self._isDestroyed then
+		return
+	end
+
+	self._flushScheduled = true
+	task.defer(function()
+		self:_flushUpdates()
+	end)
+end
+
+function Server._flushUpdates(self: Server)
+	self._flushScheduled = false
+	if self._isDestroyed then
+		return
+	end
+
+	for player, batch in self._pendingBatches do
+		if #batch > 0 and player.Parent == Players then
+			self._dataUpdate:FireClient(player, batch)
+		end
+	end
+	table.clear(self._pendingBatches)
 end
 
 --[=[
@@ -256,7 +339,9 @@ end
 	or array paths (`{ "Currency", "Coins" }`).
 
 	Returns true if the value was actually changed, false if it was already
-	equal. Replication and `DataUpdated` only fire on real changes.
+	equal. Replication and `DataUpdated` only fire on real changes. Replication
+	is deferred until the end of the current resumption — synchronous bursts of
+	writes are coalesced into a single network fire.
 
 	@within Server
 ]=]
@@ -271,11 +356,7 @@ function Server.UpdateData(self: Server, player: Player, keyPath: Shared.KeyPath
 		return false
 	end
 
-	local payload: Shared.UpdatePayload = {
-		keyPath = path,
-		value = value,
-	}
-	self._dataUpdate:FireClient(player, payload)
+	self:_queueUpdate(player, Shared.toPathString(keyPath), value, false)
 	self.DataUpdated:Fire(player, keyPath, value)
 	return true
 end
@@ -299,12 +380,7 @@ function Server.InsertData(self: Server, player: Player, keyPath: Shared.KeyPath
 		return false
 	end
 
-	local payload: Shared.UpdatePayload = {
-		keyPath = path,
-		value = value,
-		isInsert = true,
-	}
-	self._dataUpdate:FireClient(player, payload)
+	self:_queueUpdate(player, Shared.toPathString(keyPath), value, true)
 	self.DataUpdated:Fire(player, keyPath, value)
 	return true
 end
@@ -331,6 +407,7 @@ function Server.Destroy(self: Server)
 		profile:EndSession()
 		self._profiles[player] = nil
 	end
+	table.clear(self._pendingBatches)
 
 	self._requestData.OnServerInvoke = function()
 		return nil

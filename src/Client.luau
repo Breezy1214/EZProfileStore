@@ -49,7 +49,7 @@ local Shared = require(script.Parent.Shared)
 local Signal = require(script.Parent.Parent.Signal)
 
 local DEFAULT_WAIT_TIMEOUT = 30
-local MAX_PENDING_UPDATES = 256
+local MAX_PENDING_ENTRIES = 1024
 
 export type Config = {
 	remoteParent: Instance?,
@@ -62,10 +62,11 @@ export type PathWatcher = PathWatcher.PathWatcher
 export type Client = typeof(setmetatable(
 	{} :: {
 		_dataValue: Fusion.Value<{ [any]: any }?>,
-		_pendingUpdates: { Shared.UpdatePayload },
+		_pendingBatches: { Shared.Batch },
+		_pendingEntryCount: number,
+		_overflowWarned: boolean,
 		_connections: { RBXScriptConnection },
 		_scope: any,
-		_dataInit: RemoteEvent,
 		_dataUpdate: RemoteEvent,
 		_requestData: RemoteFunction,
 		_resolveReady: (data: { [any]: any }) -> (),
@@ -107,7 +108,6 @@ function Client.new(config: Config?): Client
 
 	local remoteParent = resolved.remoteParent or ReplicatedStorage
 	local folder = waitForChild(remoteParent, Shared.REMOTE_FOLDER_NAME, "Folder", timeout) :: Folder
-	local dataInit = waitForChild(folder, Shared.REMOTE_DATA_INIT, "RemoteEvent", timeout) :: RemoteEvent
 	local dataUpdate = waitForChild(folder, Shared.REMOTE_DATA_UPDATE, "RemoteEvent", timeout) :: RemoteEvent
 	local requestData = waitForChild(folder, Shared.REMOTE_REQUEST_DATA, "RemoteFunction", timeout) :: RemoteFunction
 
@@ -121,10 +121,11 @@ function Client.new(config: Config?): Client
 
 	local self = setmetatable({
 		_dataValue = scope:Value(nil),
-		_pendingUpdates = {},
+		_pendingBatches = {},
+		_pendingEntryCount = 0,
+		_overflowWarned = false,
 		_connections = {},
 		_scope = scope,
-		_dataInit = dataInit,
 		_dataUpdate = dataUpdate,
 		_requestData = requestData,
 		_resolveReady = resolveReady,
@@ -136,15 +137,8 @@ function Client.new(config: Config?): Client
 
 	table.insert(
 		self._connections,
-		dataInit.OnClientEvent:Connect(function(data)
-			self:_handleInit(data)
-		end)
-	)
-
-	table.insert(
-		self._connections,
-		dataUpdate.OnClientEvent:Connect(function(payload)
-			self:_handleUpdate(payload)
+		dataUpdate.OnClientEvent:Connect(function(batch)
+			self:_handleUpdate(batch)
 		end)
 	)
 
@@ -185,51 +179,83 @@ function Client._handleInit(self: Client, data: { [any]: any })
 
 	self._dataValue:set(data)
 
-	if #self._pendingUpdates > 0 then
-		local pending = self._pendingUpdates
-		self._pendingUpdates = {}
+	if #self._pendingBatches > 0 then
+		local pending = self._pendingBatches
+		self._pendingBatches = {}
+		self._pendingEntryCount = 0
 
-		for _, payload in pending do
-			self:_applyUpdate(payload, false)
+		for _, batch in pending do
+			self:_applyBatch(batch, false)
 		end
 	end
 
 	self._resolveReady(Fusion.peek(self._dataValue))
 end
 
-function Client._handleUpdate(self: Client, payload: Shared.UpdatePayload)
-	if self._isDestroyed then
+function Client._handleUpdate(self: Client, batch: Shared.Batch)
+	if self._isDestroyed or typeof(batch) ~= "table" then
 		return
 	end
 
 	if not self:_isInitialized() then
-		if #self._pendingUpdates >= MAX_PENDING_UPDATES then
+		local incoming = #batch
+		if self._pendingEntryCount + incoming > MAX_PENDING_ENTRIES then
+			if not self._overflowWarned then
+				self._overflowWarned = true
+				warn(
+					`EZProfileStore.Client: pre-init update buffer full at {MAX_PENDING_ENTRIES} entries; subsequent pre-snapshot updates dropped — local mirror may desync until next snapshot`
+				)
+			end
 			return
 		end
-
-		table.insert(self._pendingUpdates, payload)
+		table.insert(self._pendingBatches, batch)
+		self._pendingEntryCount += incoming
 		return
 	end
 
-	self:_applyUpdate(payload, true)
+	self:_applyBatch(batch, true)
 end
 
-function Client._applyUpdate(self: Client, payload: Shared.UpdatePayload, fireSignal: boolean)
+function Client._applyBatch(self: Client, batch: Shared.Batch, fireSignal: boolean)
 	local current = Fusion.peek(self._dataValue)
 	if current == nil then
 		return
 	end
 
-	local path = payload.keyPath
-	if #path == 0 then
-		return
+	local newData: any = current
+	-- Fire signals after `_dataValue:set` so handlers `peek`-ing the mirror
+	-- see the post-batch state, not a partial spine. Interleaved (path, value)
+	-- pairs avoid a wrapper table per entry.
+	local toFire: { any }? = if fireSignal then table.create(#batch * 2) else nil
+
+	for _, entry in batch do
+		local pathStr = entry[1]
+		if typeof(pathStr) ~= "string" then
+			continue
+		end
+
+		local path = Shared.resolveKeyPath(pathStr)
+		if #path == 0 then
+			continue
+		end
+
+		local value = entry[2]
+		local isInsert = entry[3] == true
+
+		newData = Shared.writePathSpine(newData, path, value, isInsert)
+
+		if toFire then
+			table.insert(toFire, path)
+			table.insert(toFire, value)
+		end
 	end
 
-	local newData = Shared.writePathSpine(current, path, payload.value, payload.isInsert == true)
 	self._dataValue:set(newData)
 
-	if fireSignal then
-		self.Updated:Fire(path, payload.value)
+	if toFire then
+		for i = 1, #toFire, 2 do
+			self.Updated:Fire(toFire[i], toFire[i + 1])
+		end
 	end
 end
 

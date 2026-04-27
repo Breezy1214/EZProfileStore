@@ -11,26 +11,71 @@
 local Shared = {}
 
 Shared.REMOTE_FOLDER_NAME = "_EZProfileStore"
-Shared.REMOTE_DATA_INIT = "DataInit"
 Shared.REMOTE_DATA_UPDATE = "DataUpdate"
 Shared.REMOTE_REQUEST_DATA = "RequestData"
 
 export type KeyPath = string | { string }
 
-export type UpdatePayload = {
-	keyPath: { string },
-	value: any,
-	isInsert: boolean?,
-}
+-- Wire-format tuple per replicated update:
+--   `{ pathString }`              → delete the key (value is nil)
+--   `{ pathString, value }`       → set the value at that path
+--   `{ pathString, value, true }` → table.insert `value` into the array at that path
+--
+-- A `Batch` is `{ Update, Update, ... }`. Sending positional tuples instead
+-- of a `{ keyPath = ..., value = ..., isInsert = ... }` dictionary saves the
+-- per-key serialization overhead Roblox pays on networked tables.
+export type Update = { any }
+export type Batch = { Update }
 
+local EMPTY_PATH: { string } = table.freeze({}) :: any
+
+local PATH_CACHE_LIMIT = 256
+local _pathCache: { [string]: { string } } = {}
+local _pathCacheSize = 0
+
+--[=[
+	Resolves a `KeyPath` to its array form. String paths are split on `.` and
+	the result is cached so repeated `UpdateData(player, "Stats.XP", ...)` calls
+	don't reallocate. The cache is bounded — if it fills, it's dropped wholesale
+	rather than evicted entry-by-entry, which is fine because game key-paths are
+	overwhelmingly static.
+
+	Callers must treat the returned array as read-only.
+]=]
 function Shared.resolveKeyPath(keyPath: KeyPath): { string }
 	if typeof(keyPath) == "string" then
 		if keyPath == "" then
-			return {}
+			return EMPTY_PATH
 		end
-		return string.split(keyPath, ".")
+
+		local cached = _pathCache[keyPath]
+		if cached then
+			return cached
+		end
+
+		local result = string.split(keyPath, ".")
+		if _pathCacheSize >= PATH_CACHE_LIMIT then
+			_pathCache = {}
+			_pathCacheSize = 0
+		end
+
+		_pathCache[keyPath] = result
+		_pathCacheSize += 1
+		return result
 	end
 	return keyPath
+end
+
+--[=[
+	Returns the canonical `.`-joined wire string for a `KeyPath`. String
+	keypaths are returned untouched (already in wire form); array keypaths
+	are concatenated.
+]=]
+function Shared.toPathString(keyPath: KeyPath): string
+	if typeof(keyPath) == "string" then
+		return keyPath
+	end
+	return table.concat(keyPath, ".")
 end
 
 --[=[
