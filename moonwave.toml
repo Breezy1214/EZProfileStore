@@ -1,0 +1,5 @@
+title = "EZProfileStore"
+gitRepoUrl = "https://github.com/Breezy1214/EZProfileStore"
+gitSourceBranch = "main"
+
+classOrder = ["EZProfileStore", "Server", "Client"]

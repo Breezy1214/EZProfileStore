@@ -10,7 +10,7 @@
 	snapshot. Use [Client:OnReady] or [Client:GetDataAsync] as callback or
 	yielding alternatives.
 
-	```luau
+	```lua
 	local EZProfileStore = require(Path.To.EZProfileStore)
 
 	local client = EZProfileStore.Client.new()

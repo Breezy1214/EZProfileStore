@@ -5,7 +5,7 @@
 
 	Manages player profile sessions and replicates updates to connected clients.
 
-	```luau
+	```lua
 	local EZProfileStore = require(Path.To.EZProfileStore)
 
 	local store = EZProfileStore.Server.new({
