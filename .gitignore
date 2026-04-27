@@ -1,8 +1,10 @@
 Packages/
 ServerPackages/
+DevPackages/
 sourcemap.json
 *.rbxl
 *.rbxlx
 *.rbxm
 *.rbxmx
 tasks/
+docs/

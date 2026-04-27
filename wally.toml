@@ -16,3 +16,4 @@ Fusion = "elttob/fusion@0.3.0"
 ProfileStore = "lm-loleris/profilestore@1.0.3"
 
 [dev-dependencies]
+TestEZ = "roblox/testez@0.4.1"

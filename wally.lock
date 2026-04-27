@@ -5,7 +5,7 @@ registry = "test"
 [[package]]
 name = "breezy1214/ezprofilestore"
 version = "0.1.0"
-dependencies = [["Fusion", "elttob/fusion@0.3.0"], ["PathWatcher", "breezy1214/pathwatcher@0.1.2"], ["Promise", "evaera/promise@4.0.0"], ["Signal", "sleitnick/signal@2.0.3"], ["ProfileStore", "lm-loleris/profilestore@1.0.3"]]
+dependencies = [["Fusion", "elttob/fusion@0.3.0"], ["PathWatcher", "breezy1214/pathwatcher@0.1.2"], ["Promise", "evaera/promise@4.0.0"], ["Signal", "sleitnick/signal@2.0.3"], ["ProfileStore", "lm-loleris/profilestore@1.0.3"], ["TestEZ", "roblox/testez@0.4.1"]]
 
 [[package]]
 name = "breezy1214/pathwatcher"
@@ -30,6 +30,11 @@ dependencies = []
 [[package]]
 name = "maximumadhd/delta-table"
 version = "1.1.0"
+dependencies = []
+
+[[package]]
+name = "roblox/testez"
+version = "0.4.1"
 dependencies = []
 
 [[package]]
