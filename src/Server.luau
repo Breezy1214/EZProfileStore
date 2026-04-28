@@ -3,7 +3,9 @@
 	@class Server
 	@server
 
-	Manages player profile sessions and replicates updates to connected clients.
+	Owns ProfileStore sessions for players, exposes path-based mutation helpers, and replicates server-side changes to each player's client mirror.
+
+	`Server.new` connects `Players.PlayerAdded` and `Players.PlayerRemoving` for you. Mutations made through `UpdateData`, `InsertData`, `IncrementData`, `DecrementData`, `RemoveData`, `UpdateArrayItem`, `RemoveArrayItem`, and `BatchSetValues` are persisted through ProfileStore and replicated to the owning client.
 
 	```lua
 	local EZProfileStore = require(Path.To.EZProfileStore)
@@ -27,40 +29,68 @@
 	@interface Config
 	@within Server
 	.storeName string -- Name passed to `ProfileStore.New`.
-	.template { [any]: any } -- Default profile data for new players.
+	.template { [any]: any } -- Default profile data passed to `ProfileStore.New`.
 	.keyPrefix string? -- Profile key prefix. Defaults to `"Player_"`.
-	.useMockInStudio boolean? -- Use the mock store when running in Studio.
+	.useMockInStudio boolean? -- Use `ProfileStore.Mock` in Studio.
 	.remoteParent Instance? -- Parent for the replication folder. Defaults to `ReplicatedStorage`.
+	.leaderstats { LeaderstatEntry }? -- Profile paths to mirror into `Player.leaderstats`.
+]=]
+
+--[=[
+	@interface LeaderstatEntry
+	@within Server
+	.path KeyPath -- Profile data path to mirror.
+	.name string -- Value object name under `Player.leaderstats`.
+	.type "IntValue" | "NumberValue" | "StringValue" -- Value object class.
 ]=]
 
 --[=[
 	@prop ProfileLoaded Signal<Player, Profile>
 	@within Server
 
-	Fires after a player's profile loads successfully.
+	Fires after a player's profile loads, receives `AddUserId`, and is reconciled. The `profile` argument is the live ProfileStore profile.
 ]=]
 
 --[=[
 	@prop ProfileReleased Signal<Player>
 	@within Server
 
-	Fires when a player's profile session ends.
+	Fires when EZProfileStore releases a player's profile session.
 ]=]
 
 --[=[
 	@prop FirstJoin Signal<Player, { [any]: any }>
 	@within Server
 
-	Fires the first time a player loads a profile in this store. The data
-	table is the freshly reconciled profile data and may be mutated
-	synchronously to seed defaults.
+	Fires when `profile.SessionLoadCount == 1`. The data table is the freshly reconciled profile data and may be mutated synchronously to seed defaults.
 ]=]
 
 --[=[
 	@prop DataUpdated Signal<Player, KeyPath, any>
 	@within Server
 
-	Fires after a successful `UpdateData` or `InsertData` call.
+	Fires after a replicated mutation succeeds. The path is the same path value passed to the mutation method.
+]=]
+
+--[=[
+	@prop PreSave Signal<Player, { [any]: any }>
+	@within Server
+
+	Forwards `Profile.OnSave` with the live data table. Handlers should not yield before making final synchronous changes.
+]=]
+
+--[=[
+	@prop PostSave Signal<Player, { [any]: any }>
+	@within Server
+
+	Forwards `Profile.OnAfterSave` with the saved data snapshot.
+]=]
+
+--[=[
+	@prop LastSave Signal<Player, "Manual" | "External" | "Shutdown">
+	@within Server
+
+	Forwards `Profile.OnLastSave` with ProfileStore's final-save reason.
 ]=]
 
 local Players = game:GetService("Players")
@@ -243,6 +273,8 @@ end
 	Creates a new server-side store. Binds player join/leave handlers,
 	processes players already in the server, and provisions the replication
 	remotes under `config.remoteParent` (defaults to `ReplicatedStorage`).
+	Use `useMockInStudio = true` to opt into `ProfileStore.Mock` while testing
+	in Studio.
 
 	@within Server
 	@param config Config
@@ -325,7 +357,7 @@ function Server._waitForData(self: Server, player: Player): { [any]: any }?
 
 	local profile = self._profiles[player]
 	if profile then
-		return profile.Data
+		return self:_consumeSnapshot(player, profile)
 	end
 
 	local ok = Promise.fromEvent(self.ProfileLoaded, function(loadedPlayer)
@@ -339,7 +371,40 @@ function Server._waitForData(self: Server, player: Player): { [any]: any }?
 	end
 
 	profile = self._profiles[player]
-	return profile and profile.Data or nil
+	return if profile then self:_consumeSnapshot(player, profile) else nil
+end
+
+function Server._consumeSnapshot(self: Server, player: Player, profile: Profile): { [any]: any }
+	self._pendingBatches[player] = nil
+	return profile.Data
+end
+
+function Server._disconnectProfileConnections(self: Server, player: Player)
+	local profileConns = self._profileConnections[player]
+	if not profileConns then
+		return
+	end
+
+	for _, conn in profileConns do
+		conn:Disconnect()
+	end
+	self._profileConnections[player] = nil
+end
+
+function Server._releaseProfile(self: Server, player: Player, profile: Profile, shouldKick: boolean)
+	if self._profiles[player] ~= profile then
+		return
+	end
+
+	self._profiles[player] = nil
+	self._pendingBatches[player] = nil
+	self._leaderstats[player] = nil
+	self:_disconnectProfileConnections(player)
+	self.ProfileReleased:Fire(player)
+
+	if shouldKick and player.Parent == Players then
+		player:Kick("Profile session ended - please rejoin")
+	end
 end
 
 function Server._onPlayerAdded(self: Server, player: Player)
@@ -379,20 +444,12 @@ function Server._onPlayerAdded(self: Server, player: Player)
 		profile.OnLastSave:Connect(function(reason)
 			self.LastSave:Fire(player, reason)
 		end),
+		profile.OnSessionEnd:Connect(function()
+			self:_releaseProfile(player, profile, not self._isDestroyed)
+		end),
 	}
 
-	profile.OnSessionEnd:Connect(function()
-		self._profiles[player] = nil
-		self._pendingBatches[player] = nil
-		self.ProfileReleased:Fire(player)
-		if player.Parent == Players then
-			player:Kick("Profile session ended - please rejoin")
-		end
-	end)
-
-	local isFirstJoin = profile.Data._ezpsCreatedAt == nil
-	if isFirstJoin then
-		profile.Data._ezpsCreatedAt = os.time()
+	if profile.SessionLoadCount == 1 then
 		self.FirstJoin:Fire(player, profile.Data)
 	end
 
@@ -404,17 +461,12 @@ function Server._onPlayerRemoving(self: Server, player: Player)
 	self._leaderstats[player] = nil
 	self._pendingBatches[player] = nil
 
-	local profileConns = self._profileConnections[player]
-	if profileConns then
-		for _, conn in profileConns do
-			conn:Disconnect()
-		end
-		self._profileConnections[player] = nil
-	end
-
 	local profile = self._profiles[player]
 	if profile then
 		profile:EndSession()
+		self:_releaseProfile(player, profile, false)
+	else
+		self:_disconnectProfileConnections(player)
 	end
 end
 
@@ -558,9 +610,7 @@ end
 	Returns the player's data table by reference, or `nil` if no profile has
 	loaded.
 
-	Direct mutations persist on the next save but do **not** replicate to the
-	client. Use [Server:UpdateData] or [Server:InsertData] for replicated
-	changes.
+	Direct mutations persist on the next ProfileStore save, but they do **not** replicate to the client and they do not fire [Server.DataUpdated]. Use the mutation methods for gameplay writes that clients need to observe.
 
 	@within Server
 	@method GetData
@@ -573,8 +623,7 @@ function Server.GetData(self: Server, player: Player): { [any]: any }?
 end
 
 --[=[
-	Reads the value at `keyPath`. Returns `nil` if the path does not resolve
-	or the profile has not loaded.
+	Reads the value at `keyPath`. Returns `nil` if the path does not resolve or the profile has not loaded. `keyPath` may be a dot string like `"Stats.Wins"` or an array like `{ "Stats", "Wins" }`.
 
 	@within Server
 	@method ReadData
@@ -602,7 +651,7 @@ end
 	@method UpdateData
 	@param player Player
 	@param keyPath KeyPath
-	@param value any
+	@param value any -- Passing `nil` deletes the path.
 	@return boolean -- `true` if the value changed, `false` otherwise.
 ]=]
 function Server.UpdateData(self: Server, player: Player, keyPath: Shared.KeyPath, value: any): boolean
@@ -623,8 +672,7 @@ function Server.UpdateData(self: Server, player: Player, keyPath: Shared.KeyPath
 end
 
 --[=[
-	Appends `value` to the array at `keyPath`. The target must be a table; if
-	it isn't, this warns and returns `false` without replicating.
+	Appends `value` to the array at `keyPath`. The target must be a table; if it is missing or not a table, this warns and returns `false` without mutating or replicating.
 
 	@within Server
 	@method InsertData
@@ -702,8 +750,7 @@ function Server.DecrementData(self: Server, player: Player, keyPath: Shared.KeyP
 end
 
 --[=[
-	Sets the value at `keyPath` to `nil`. Returns `false` when no profile is
-	loaded or the path is already `nil` (no-op, no replication).
+	Sets the value at `keyPath` to `nil`. Returns `false` when no profile is loaded or the path is already `nil`. Missing parent tables are not created.
 
 	@within Server
 	@method RemoveData
@@ -796,9 +843,7 @@ end
 
 --[=[
 	Applies multiple set/del writes to the player's profile in one frame.
-	Each entry's `value` follows the same semantics as `UpdateData`: `nil`
-	deletes, anything else sets. Returns the count of paths that actually
-	changed (no-ops are not counted).
+	Each entry's `value` follows the same semantics as `UpdateData`: `nil` deletes, anything else sets. Returns the number of paths that actually changed.
 
 	All wire entries from a single call will batch into the same network
 	event since they're queued before the next deferred flush.
@@ -830,7 +875,7 @@ end
 
 --[=[
 	Forces an immediate save via `profile:Save()`. Returns `false` when no
-	profile is loaded for `player`.
+	profile is loaded for `player`. ProfileStore already auto-saves and saves when sessions end, so reserve this for critical checkpoints such as product receipts.
 
 	@within Server
 	@method SaveAsync
@@ -860,9 +905,7 @@ function Server.IsReady(self: Server, player: Player): boolean
 end
 
 --[=[
-	Removes the player's stored data via `ProfileStore:RemoveAsync`. Accepts
-	either a `Player` (whose active session, if any, is ended first) or a raw
-	`UserId` (offline wipe).
+	Removes the player's stored data via `ProfileStore:RemoveAsync`. Accepts either a `Player` (whose active session, if any, is ended first) or a raw `UserId` (offline wipe). Use carefully: this erases the ProfileStore key for the configured store and key prefix.
 
 	@within Server
 	@method WipeAsync
@@ -887,8 +930,7 @@ function Server.WipeAsync(self: Server, target: Player | number): boolean
 end
 
 --[=[
-	Ends all active profile sessions, disconnects player listeners, and
-	releases signals. The replication remotes are not removed.
+	Ends all active profile sessions, disconnects player listeners, and releases signals. Save-related ProfileStore signals remain connected while sessions are being ended. The replication remotes are not removed.
 
 	@within Server
 	@method Destroy
@@ -904,17 +946,11 @@ function Server.Destroy(self: Server)
 	end
 	table.clear(self._connections)
 
-	for _, conns in self._profileConnections do
-		for _, conn in conns do
-			conn:Disconnect()
-		end
+	for player, profile in table.clone(self._profiles) do
+		profile:EndSession()
+		self:_releaseProfile(player, profile, false)
 	end
 	table.clear(self._profileConnections)
-
-	for player, profile in self._profiles do
-		profile:EndSession()
-		self._profiles[player] = nil
-	end
 	table.clear(self._pendingBatches)
 
 	self._requestData.OnServerInvoke = function()

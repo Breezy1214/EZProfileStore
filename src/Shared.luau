@@ -101,8 +101,11 @@ end
 	Mutates `root` in place, materializing missing intermediate tables.
 	Returns `true` only when a real change is made:
 	- set: `false` if the target already equals `value`.
-	- insert: `false` if the target is not a table.
+	- delete: `false` if the path is already missing.
+	- insert: `false` if the target is missing or not a table.
 	- empty path: always `false`.
+
+	Missing parents are created only for non-nil set operations. Deletes and inserts are no-ops when their parent path does not exist.
 
 	@private
 ]=]
@@ -111,10 +114,18 @@ function Shared.writePath(root: any, path: { string }, value: any, isInsert: boo
 		return false
 	end
 
+	local createMissingParents = not isInsert and value ~= nil
 	local target: any = root
 	for i = 1, #path - 1 do
+		if typeof(target) ~= "table" then
+			return false
+		end
+
 		local key = path[i]
 		if typeof(target[key]) ~= "table" then
+			if not createMissingParents then
+				return false
+			end
 			target[key] = {}
 		end
 		target = target[key]
@@ -198,11 +209,54 @@ end
 	value written at the leaf. Sibling subtrees keep reference identity so
 	Fusion observers only re-evaluate along the changed spine.
 
+	Missing parents are created only for non-nil set operations. Invalid deletes and inserts return the original root reference.
+
 	@private
 ]=]
 function Shared.writePathSpine<T>(root: T, path: { string }, value: any, isInsert: boolean): T
 	if #path == 0 then
 		return root
+	end
+
+	if isInsert or value == nil then
+		local existing: any = root
+		for i = 1, #path - 1 do
+			if typeof(existing) ~= "table" then
+				return root
+			end
+			existing = existing[path[i]]
+		end
+
+		if typeof(existing) ~= "table" then
+			return root
+		end
+
+		local finalKey = path[#path]
+		if isInsert then
+			if typeof(existing[finalKey]) ~= "table" then
+				return root
+			end
+		elseif existing[finalKey] == nil then
+			return root
+		end
+
+		local newRoot: any = table.clone(root :: any)
+		local target: any = newRoot
+		for i = 1, #path - 1 do
+			local key = path[i]
+			target[key] = table.clone(target[key])
+			target = target[key]
+		end
+
+		if isInsert then
+			local newArr = table.clone(target[finalKey])
+			table.insert(newArr, value)
+			target[finalKey] = newArr
+		else
+			target[finalKey] = nil
+		end
+
+		return newRoot :: T
 	end
 
 	local newRoot: any = if typeof(root) == "table" then table.clone(root :: any) else {}
@@ -216,16 +270,7 @@ function Shared.writePathSpine<T>(root: T, path: { string }, value: any, isInser
 	end
 
 	local finalKey = path[#path]
-	if isInsert then
-		local arr = target[finalKey]
-		if typeof(arr) == "table" then
-			local newArr = table.clone(arr)
-			table.insert(newArr, value)
-			target[finalKey] = newArr
-		end
-	else
-		target[finalKey] = value
-	end
+	target[finalKey] = value
 
 	return newRoot :: T
 end

@@ -15,9 +15,15 @@ local function makeClient(initial: { [any]: any }?): any
 		_overflowWarned = false,
 		_connections = {},
 		_scope = scope,
+		_rejectedReason = nil,
+		_rejectReady = function() end,
 		_isDestroyed = false,
 		Updated = Signal.new(),
 	}, { __index = Client })
+	
+	self._rejectReady = function(reason)
+		self._rejectedReason = reason
+	end
 	return self
 end
 
@@ -65,6 +71,24 @@ return function()
 				{ Shared.OP.Set, "B", 2 },
 			}, true)
 			expect(fires).to.equal(2)
+		end)
+	end)
+
+	describe("Client._rejectInit", function()
+		it("rejects readiness when the snapshot cannot be loaded", function()
+			local c = makeClient(nil)
+
+			c:_rejectInit("snapshot failed")
+
+			expect(c._rejectedReason).to.equal("snapshot failed")
+		end)
+
+		it("does not reject after the snapshot is initialized", function()
+			local c = makeClient({ Coins = 0 })
+
+			c:_rejectInit("snapshot failed")
+
+			expect(c._rejectedReason).to.equal(nil)
 		end)
 	end)
 end

@@ -2,10 +2,10 @@
 --[=[
 	@class EZProfileStore
 
-	A ProfileStore wrapper with automatic client replication.
+	Package entrypoint. `Server` and `Client` are loaded lazily so client-only code can require the package without loading server-only ProfileStore dependencies.
 
-	- [Server](/api/Server) — manages profile sessions and replicates updates to clients.
-	- [Client](/api/Client) — mirrors the player's profile and exposes path-based observers.
+	- [Server](/api/Server) - manages profile sessions and replicates updates to clients.
+	- [Client](/api/Client) - mirrors the player's profile and exposes path-based observers.
 ]=]
 
 local loaded: { [string]: any } = {}

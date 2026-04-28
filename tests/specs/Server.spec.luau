@@ -14,6 +14,7 @@ end
 local function makeFakeProfile(data: { [any]: any })
 	return {
 		Data = data,
+		SessionLoadCount = 1,
 		OnSave = Signal.new(),
 		OnAfterSave = Signal.new(),
 		OnLastSave = Signal.new(),
@@ -79,6 +80,22 @@ return function()
 			expect(batch[1][1]).to.equal(Shared.OP.Ins)
 			expect(batch[1][2]).to.equal("Items")
 			expect(batch[1][3]).to.equal("Sword")
+
+			server:Destroy()
+		end)
+
+		it("_waitForData consumes pending updates already represented in the snapshot", function()
+			local server = makeServer({ Items = {} })
+			local player = makeFakePlayer()
+			seed(server, player, { Items = {} })
+
+			server:InsertData(player, "Items", "Sword")
+			expect(#server._pendingBatches[player]).to.equal(1)
+
+			local snapshot = server:_waitForData(player)
+
+			expect(snapshot.Items[1]).to.equal("Sword")
+			expect(server._pendingBatches[player]).to.equal(nil)
 
 			server:Destroy()
 		end)
@@ -391,6 +408,41 @@ return function()
 			expect(fired).to.equal(true)
 
 			conn:Disconnect()
+			server:Destroy()
+		end)
+
+		it("keeps save signal forwarding active while ending a player session", function()
+			local server = makeServer()
+			local player = makeFakePlayer()
+			local profile = seed(server, player, { Coins = 0 })
+			server._profileConnections[player] = {
+				profile.OnSave:Connect(function()
+					server.PreSave:Fire(player, profile.Data)
+				end),
+				profile.OnLastSave:Connect(function(reason)
+					server.LastSave:Fire(player, reason)
+				end),
+			}
+			profile.EndSession = function()
+				profile.OnSave:Fire()
+				profile.OnLastSave:Fire("Manual")
+				profile.OnSessionEnd:Fire()
+			end
+
+			local preSaveFired = false
+			local lastSaveReason = nil
+			server.PreSave:Connect(function()
+				preSaveFired = true
+			end)
+			server.LastSave:Connect(function(_, reason)
+				lastSaveReason = reason
+			end)
+
+			server:_onPlayerRemoving(player)
+
+			expect(preSaveFired).to.equal(true)
+			expect(lastSaveReason).to.equal("Manual")
+
 			server:Destroy()
 		end)
 

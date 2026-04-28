@@ -3,8 +3,7 @@
 	@class Client
 	@client
 
-	Mirrors the player's profile in a Fusion state object and exposes
-	path-based observers.
+	Mirrors the local player's profile in a Fusion state object and exposes read-only, path-based observers for UI code.
 
 	[Client.Ready](#Ready) is a Promise that resolves with the initial
 	snapshot. Use [Client:OnReady] or [Client:GetDataAsync] as callback or
@@ -43,17 +42,14 @@
 	@prop Ready Promise<{ [any]: any }>
 	@within Client
 
-	Resolves with the initial profile snapshot. Rejects if the client is
-	destroyed before the snapshot arrives.
+	Resolves with the initial profile snapshot. Rejects if the client is destroyed or the server cannot provide a snapshot.
 ]=]
 
 --[=[
 	@prop Updated Signal<{ string }, any>
 	@within Client
 
-	Fires for each path/value pair applied from a server update. Path is the
-	resolved array form. Use [Client:WatchPath] or [Client:OnChanged] for
-	path-scoped subscriptions.
+	Fires for each path/value pair applied from a server update. Path is the resolved array form. This signal is useful for diagnostics or broad observers; use [Client:WatchPath] or [Client:OnChanged] for most UI code.
 ]=]
 
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
@@ -166,7 +162,9 @@ function Client.new(config: Config?): Client
 		end)
 
 		if not ok then
-			warn(`EZProfileStore.Client: snapshot request failed: {snapshot}`)
+			local reason = `EZProfileStore.Client: snapshot request failed: {snapshot}`
+			warn(reason)
+			self:_rejectInit(reason)
 			return
 		end
 
@@ -174,9 +172,12 @@ function Client.new(config: Config?): Client
 			return
 		end
 
-		if snapshot ~= nil then
-			self:_handleInit(snapshot)
+		if snapshot == nil then
+			self:_rejectInit("EZProfileStore.Client: snapshot request returned nil")
+			return
 		end
+
+		self:_handleInit(snapshot)
 	end)
 
 	return self
@@ -184,6 +185,14 @@ end
 
 function Client._isInitialized(self: Client): boolean
 	return Fusion.peek(self._dataValue) ~= nil
+end
+
+function Client._rejectInit(self: Client, reason: any)
+	if self._isDestroyed or self:_isInitialized() then
+		return
+	end
+
+	self._rejectReady(reason)
 end
 
 function Client._handleInit(self: Client, data: { [any]: any })
@@ -217,7 +226,7 @@ function Client._handleUpdate(self: Client, batch: Shared.Batch)
 			if not self._overflowWarned then
 				self._overflowWarned = true
 				warn(
-					`EZProfileStore.Client: pre-init update buffer full at {MAX_PENDING_ENTRIES} entries; subsequent pre-snapshot updates dropped — local mirror may desync until next snapshot`
+					`EZProfileStore.Client: pre-init update buffer full at {MAX_PENDING_ENTRIES} entries; later pre-snapshot updates were dropped`
 				)
 			end
 			return
@@ -287,8 +296,7 @@ function Client._applyBatch(self: Client, batch: Shared.Batch, fireSignal: boole
 end
 
 --[=[
-	Returns the local snapshot, or `nil` if the initial payload has not
-	arrived. The returned table is read-only; do not mutate.
+	Returns the local snapshot, or `nil` if the initial payload has not arrived. Treat the returned table as read-only. Client mutations are local only and will be overwritten by later server updates.
 
 	@within Client
 	@method GetData
@@ -299,8 +307,7 @@ function Client.GetData(self: Client): { [any]: any }?
 end
 
 --[=[
-	Returns the underlying `Fusion.Value` holding the snapshot. Bind it into
-	Computeds or hydrate UI directly.
+	Returns the underlying `Fusion.Value` holding the snapshot. Bind it into Computeds or hydrate UI directly. Treat the contained table as read-only.
 
 	@within Client
 	@method GetDataState
@@ -311,8 +318,7 @@ function Client.GetDataState(self: Client)
 end
 
 --[=[
-	Yields until the initial payload arrives, then returns it. Errors after
-	`timeout` seconds.
+	Yields until the initial payload arrives, then returns it. Errors after `timeout` seconds. Use this when imperative code needs a loaded snapshot before continuing.
 
 	@within Client
 	@method GetDataAsync
@@ -353,8 +359,7 @@ function Client.IsReady(self: Client): boolean
 end
 
 --[=[
-	Calls `callback` once with the initial snapshot. Runs on the next frame
-	if already loaded, otherwise when the snapshot arrives.
+	Calls `callback` once with the initial snapshot. Runs on the next frame if already loaded, otherwise when the snapshot arrives. The returned function cancels the pending callback.
 
 	@within Client
 	@method OnReady
@@ -369,9 +374,7 @@ function Client.OnReady(self: Client, callback: (data: { [any]: any }) -> ()): D
 end
 
 --[=[
-	Returns a `PathWatcher` bound to `keyPath` on the local Fusion mirror.
-	Use the watcher's `.Value` inside Fusion Computeds or `:onChange(fn)` for
-	callbacks. Call `:Destroy()` on the watcher when finished.
+	Returns a `PathWatcher` bound to `keyPath` on the local Fusion mirror. Use the watcher's `.Value` inside Fusion Computeds or `:onChange(fn)` for callbacks. Call `:Destroy()` on the watcher when the UI owner unmounts.
 
 	@within Client
 	@method WatchPath

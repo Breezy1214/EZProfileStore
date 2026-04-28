@@ -102,4 +102,40 @@ return function()
 			expect(Shared.arrayRemoveSpine(root, { "Items" }, 5)).to.equal(root)
 		end)
 	end)
+
+	describe("Shared.writePath", function()
+		it("does not materialize parents for missing deletes", function()
+			local root = {}
+			local changed = Shared.writePath(root, { "Stats", "Coins" }, nil, false)
+
+			expect(changed).to.equal(false)
+			expect(root.Stats).to.equal(nil)
+		end)
+
+		it("does not materialize parents for invalid inserts", function()
+			local root = {}
+			local changed = Shared.writePath(root, { "Inventory", "Items" }, "Sword", true)
+
+			expect(changed).to.equal(false)
+			expect(root.Inventory).to.equal(nil)
+		end)
+	end)
+
+	describe("Shared.writePathSpine", function()
+		it("returns the same root for missing deletes", function()
+			local root = {}
+			local newRoot = Shared.writePathSpine(root, { "Stats", "Coins" }, nil, false)
+
+			expect(newRoot).to.equal(root)
+			expect(root.Stats).to.equal(nil)
+		end)
+
+		it("returns the same root for invalid inserts", function()
+			local root = {}
+			local newRoot = Shared.writePathSpine(root, { "Inventory", "Items" }, "Sword", true)
+
+			expect(newRoot).to.equal(root)
+			expect(root.Inventory).to.equal(nil)
+		end)
+	end)
 end
