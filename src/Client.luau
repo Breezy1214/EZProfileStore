@@ -84,8 +84,6 @@ export type Client = typeof(setmetatable(
 		_overflowWarned: boolean,
 		_connections: { RBXScriptConnection },
 		_scope: any,
-		_dataUpdate: RemoteEvent,
-		_requestData: RemoteFunction,
 		_resolveReady: (data: { [any]: any }) -> (),
 		_rejectReady: (reason: any) -> (),
 		_isDestroyed: boolean,
@@ -144,8 +142,6 @@ function Client.new(config: Config?): Client
 		_overflowWarned = false,
 		_connections = {},
 		_scope = scope,
-		_dataUpdate = dataUpdate,
-		_requestData = requestData,
 		_resolveReady = resolveReady,
 		_rejectReady = rejectReady,
 		_isDestroyed = false,
@@ -241,12 +237,12 @@ function Client._applyBatch(self: Client, batch: Shared.Batch, fireSignal: boole
 	end
 
 	local newData: any = current
-	-- Defer signal fires until after `_dataValue:set` so handlers see the post-batch state.
 	local toFire: { any }? = if fireSignal then table.create(#batch * 2) else nil
 
 	for _, entry in batch do
-		local pathStr = entry[1]
-		if typeof(pathStr) ~= "string" then
+		local opcode = entry[1]
+		local pathStr = entry[2]
+		if typeof(opcode) ~= "string" or typeof(pathStr) ~= "string" then
 			continue
 		end
 
@@ -255,14 +251,29 @@ function Client._applyBatch(self: Client, batch: Shared.Batch, fireSignal: boole
 			continue
 		end
 
-		local value = entry[2]
-		local isInsert = entry[3] == true
-
-		newData = Shared.writePathSpine(newData, path, value, isInsert)
+		local fireValue: any = nil
+		if opcode == Shared.OP.Set then
+			newData = Shared.writePathSpine(newData, path, entry[3], false)
+			fireValue = entry[3]
+		elseif opcode == Shared.OP.Del then
+			newData = Shared.writePathSpine(newData, path, nil, false)
+			fireValue = nil
+		elseif opcode == Shared.OP.Ins then
+			newData = Shared.writePathSpine(newData, path, entry[3], true)
+			fireValue = entry[3]
+		elseif opcode == Shared.OP.AUpd then
+			newData = Shared.arrayUpdateSpine(newData, path, entry[3], entry[4])
+			fireValue = entry[4]
+		elseif opcode == Shared.OP.ARm then
+			newData = Shared.arrayRemoveSpine(newData, path, entry[3])
+			fireValue = nil
+		else
+			continue
+		end
 
 		if toFire then
 			table.insert(toFire, path)
-			table.insert(toFire, value)
+			table.insert(toFire, fireValue)
 		end
 	end
 

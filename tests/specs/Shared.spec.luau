@@ -1,0 +1,105 @@
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+
+local PackageRoot = ReplicatedStorage.Packages.EZProfileStore
+local Shared = require(PackageRoot.Shared)
+
+return function()
+	describe("Shared.OP", function()
+		it("exposes the five opcodes", function()
+			expect(Shared.OP.Set).to.equal("set")
+			expect(Shared.OP.Del).to.equal("del")
+			expect(Shared.OP.Ins).to.equal("ins")
+			expect(Shared.OP.AUpd).to.equal("aupd")
+			expect(Shared.OP.ARm).to.equal("arm")
+		end)
+	end)
+
+	describe("Shared.arrayUpdate", function()
+		it("replaces the value at a 1-based index", function()
+			local root = { Items = { "a", "b", "c" } }
+			local changed = Shared.arrayUpdate(root, { "Items" }, 2, "B")
+			expect(changed).to.equal(true)
+			expect(root.Items[2]).to.equal("B")
+		end)
+
+		it("returns false on out-of-bounds index", function()
+			local root = { Items = { "a" } }
+			expect(Shared.arrayUpdate(root, { "Items" }, 0, "x")).to.equal(false)
+			expect(Shared.arrayUpdate(root, { "Items" }, 5, "x")).to.equal(false)
+			expect(root.Items[1]).to.equal("a")
+		end)
+
+		it("returns false when target is not an array", function()
+			local root = { Stats = { Coins = 5 } }
+			expect(Shared.arrayUpdate(root, { "Stats" }, 1, "x")).to.equal(false)
+		end)
+
+		it("returns false on empty path", function()
+			expect(Shared.arrayUpdate({}, {}, 1, "x")).to.equal(false)
+		end)
+	end)
+
+	describe("Shared.arrayRemove", function()
+		it("removes the value at a 1-based index and shrinks length", function()
+			local root = { Items = { "a", "b", "c" } }
+			local changed = Shared.arrayRemove(root, { "Items" }, 2)
+			expect(changed).to.equal(true)
+			expect(root.Items[1]).to.equal("a")
+			expect(root.Items[2]).to.equal("c")
+			expect(#root.Items).to.equal(2)
+		end)
+
+		it("returns false on out-of-bounds index", function()
+			local root = { Items = { "a" } }
+			expect(Shared.arrayRemove(root, { "Items" }, 0)).to.equal(false)
+			expect(Shared.arrayRemove(root, { "Items" }, 5)).to.equal(false)
+			expect(#root.Items).to.equal(1)
+		end)
+
+		it("returns false when target is not an array", function()
+			local root = { Stats = { Coins = 5 } }
+			expect(Shared.arrayRemove(root, { "Stats" }, 1)).to.equal(false)
+		end)
+	end)
+
+	describe("Shared.arrayUpdateSpine", function()
+		it("returns a new root with the array spine cloned", function()
+			local root = { Items = { "a", "b", "c" }, Other = { kept = true } }
+			local newRoot = Shared.arrayUpdateSpine(root, { "Items" }, 2, "B")
+			expect(newRoot).never.to.equal(root)
+			expect(newRoot.Items).never.to.equal(root.Items)
+			expect(newRoot.Other).to.equal(root.Other) -- sibling identity preserved
+			expect(newRoot.Items[2]).to.equal("B")
+			expect(root.Items[2]).to.equal("b") -- original untouched
+		end)
+
+		it("returns root unchanged when target is not an array", function()
+			local root = { Stats = { Coins = 5 } }
+			local newRoot = Shared.arrayUpdateSpine(root, { "Stats" }, 1, "x")
+			expect(newRoot).to.equal(root)
+		end)
+
+		it("returns root unchanged on empty path", function()
+			local root = {}
+			expect(Shared.arrayUpdateSpine(root, {}, 1, "x")).to.equal(root)
+		end)
+	end)
+
+	describe("Shared.arrayRemoveSpine", function()
+		it("returns a new root with the array shrunk", function()
+			local root = { Items = { "a", "b", "c" }, Other = { kept = true } }
+			local newRoot = Shared.arrayRemoveSpine(root, { "Items" }, 2)
+			expect(newRoot).never.to.equal(root)
+			expect(newRoot.Items).never.to.equal(root.Items)
+			expect(newRoot.Other).to.equal(root.Other)
+			expect(#newRoot.Items).to.equal(2)
+			expect(newRoot.Items[2]).to.equal("c")
+			expect(#root.Items).to.equal(3) -- original untouched
+		end)
+
+		it("returns root unchanged when index is out of bounds", function()
+			local root = { Items = { "a" } }
+			expect(Shared.arrayRemoveSpine(root, { "Items" }, 5)).to.equal(root)
+		end)
+	end)
+end

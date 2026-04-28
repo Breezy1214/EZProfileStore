@@ -8,9 +8,16 @@ EZProfileStore handles profile session lifecycle on the server, mirrors each pla
 
 - Drop-in profile lifecycle: sessions, reconciliation, first-join detection.
 - Pathwise mutation: `UpdateData(player, "Currency.Coins", 100)` or `{ "Currency", "Coins" }`.
+- Numeric helpers: `IncrementData` / `DecrementData`.
+- Array index ops: `UpdateArrayItem`, `RemoveArrayItem`, plus existing `InsertData`.
+- Generalized leaf removal: `RemoveData`.
+- Atomic multi-write: `BatchSetValues({ { path, value }, ... })`.
 - Coalesced replication: synchronous bursts of writes ship as a single network event per frame.
 - Fusion-native client mirror: bind into Computeds or use `WatchPath` for path-scoped observers.
 - Promise-based readiness: `client.Ready:andThen(...)` or yielding/callback wrappers.
+- ProfileStore save signal forwards: `PreSave`, `PostSave`, `LastSave`.
+- Convenience: `SaveAsync`, `WipeAsync`, `IsReady`.
+- `leaderstats` Folder mirror — declare paths and the Roblox built-in player list updates automatically.
 
 ## Installation
 
@@ -72,6 +79,23 @@ end)
 -- One-shot read from the local snapshot
 local coins = client:Read("Coins")
 ```
+
+### Leaderstats
+
+Declare which profile paths mirror to `Player.leaderstats` (the Roblox built-in player list):
+
+```lua
+local store = EZProfileStore.Server.new({
+	storeName = "PlayerData_v1",
+	template = { Coins = 0, Stats = { Wins = 0 } },
+	leaderstats = {
+		{ path = "Coins",      name = "Coins", type = "IntValue" },
+		{ path = "Stats.Wins", name = "Wins",  type = "IntValue" },
+	},
+})
+```
+
+Any mutation that changes a tracked path — directly or via a parent write — is reflected in the corresponding `IntValue`/`NumberValue`/`StringValue` on the next frame's flush.
 
 ## API Reference
 

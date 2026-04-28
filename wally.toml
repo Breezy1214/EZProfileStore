@@ -5,6 +5,22 @@ version = "0.1.0"
 license = "MIT"
 realm = "shared"
 registry = "https://github.com/UpliftGames/wally-index"
+exclude = [
+	"DevPackages",
+	"Packages",
+	"ServerPackages",
+	"docs",
+	"tasks",
+	"tests",
+	"dev.project.json",
+	"test.project.json",
+	"testez.yml",
+	"moonwave.toml",
+	"sourcemap.json",
+	"rokit.toml",
+	"selene.toml",
+	"stylua.toml",
+]
 
 [dependencies]
 Promise = "evaera/promise@4.0.0"

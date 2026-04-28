@@ -67,7 +67,6 @@ local Players = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local RunService = game:GetService("RunService")
 
-local ProfileStore = require(script.Parent.Parent.ProfileStore)
 local Promise = require(script.Parent.Parent.Promise)
 local Shared = require(script.Parent.Shared)
 local Signal = require(script.Parent.Parent.Signal)
@@ -75,37 +74,116 @@ local Signal = require(script.Parent.Parent.Signal)
 local DEFAULT_KEY_PREFIX = "Player_"
 local SNAPSHOT_WAIT_TIMEOUT = 30
 
+export type LeaderstatEntry = {
+	path: Shared.KeyPath,
+	name: string,
+	type: "IntValue" | "NumberValue" | "StringValue",
+}
+
+type ResolvedLeaderstatEntry = {
+	path: { string },
+	pathStr: string,
+	name: string,
+	type: "IntValue" | "NumberValue" | "StringValue",
+}
+
 export type Config = {
 	storeName: string,
 	template: { [any]: any },
 	keyPrefix: string?,
 	useMockInStudio: boolean?,
 	remoteParent: Instance?,
+	leaderstats: { LeaderstatEntry }?,
 }
 
 export type Profile = any
+type ValueBase = IntValue | NumberValue | StringValue
 export type Server = typeof(setmetatable(
 	{} :: {
 		_store: any,
 		_keyPrefix: string,
 		_profiles: { [Player]: Profile },
 		_connections: { RBXScriptConnection },
-		_remoteFolder: Folder,
+		_profileConnections: { [Player]: { RBXScriptConnection } },
 		_dataUpdate: RemoteEvent,
 		_requestData: RemoteFunction,
 		_isDestroyed: boolean,
 		_pendingBatches: { [Player]: Shared.Batch },
 		_flushScheduled: boolean,
+		_leaderstatsConfig: { ResolvedLeaderstatEntry },
+		_leaderstats: { [Player]: { [string]: ValueBase } },
 		ProfileLoaded: Signal.Signal<Player, Profile>,
 		ProfileReleased: Signal.Signal<Player>,
 		FirstJoin: Signal.Signal<Player, { [any]: any }>,
 		DataUpdated: Signal.Signal<Player, Shared.KeyPath, any>,
+		PreSave: Signal.Signal<Player, { [any]: any }>,
+		PostSave: Signal.Signal<Player, { [any]: any }>,
+		LastSave: Signal.Signal<Player, "Manual" | "External" | "Shutdown">,
 	},
 	{} :: { __index: any }
 ))
 
 local Server = {}
 Server.__index = Server
+
+local resolvedProfileStore: any? = nil
+
+local function requireProfileStoreModule(module: Instance?, location: string): any?
+	if module == nil then
+		return nil
+	end
+	if not module:IsA("ModuleScript") then
+		error(`EZProfileStore.Server: {location} is a {module.ClassName}, expected ModuleScript`, 3)
+	end
+	return require(module)
+end
+
+local function findProfileStoreInService(serviceName: string): any?
+	local ok, service = pcall(function()
+		return game:GetService(serviceName)
+	end)
+	if not ok then
+		return nil
+	end
+
+	local serverPackages = service:FindFirstChild("ServerPackages")
+	if not serverPackages then
+		return nil
+	end
+
+	return requireProfileStoreModule(
+		serverPackages:FindFirstChild("ProfileStore"),
+		`{serviceName}.ServerPackages.ProfileStore`
+	)
+end
+
+local function getProfileStore(): any
+	if resolvedProfileStore ~= nil then
+		return resolvedProfileStore
+	end
+
+	local packageParent = script.Parent.Parent
+	resolvedProfileStore = requireProfileStoreModule(
+		packageParent:FindFirstChild("ProfileStore"),
+		`{packageParent:GetFullName()}.ProfileStore`
+	)
+	if resolvedProfileStore ~= nil then
+		return resolvedProfileStore
+	end
+
+	resolvedProfileStore = findProfileStoreInService("ServerScriptService")
+		or findProfileStoreInService("ServerStorage")
+		or findProfileStoreInService("ReplicatedStorage")
+
+	if resolvedProfileStore == nil then
+		error(
+			"EZProfileStore.Server: could not find ProfileStore. Install EZProfileStore with Wally and mount ServerPackages, or place ProfileStore next to the package in _Index.",
+			3
+		)
+	end
+
+	return resolvedProfileStore
+end
 
 local function ensureChild(parent: Instance, name: string, className: string): Instance
 	local existing = parent:FindFirstChild(name)
@@ -128,6 +206,39 @@ local function ensureRemoteFolder(remoteParent: Instance): Folder
 	return ensureChild(remoteParent, Shared.REMOTE_FOLDER_NAME, "Folder") :: Folder
 end
 
+local LEADERSTAT_TYPE_TO_LUA: { [string]: string } = {
+	IntValue = "number",
+	NumberValue = "number",
+	StringValue = "string",
+}
+
+local function validateLeaderstats(template: { [any]: any }, entries: { LeaderstatEntry }): { ResolvedLeaderstatEntry }
+	local resolved: { ResolvedLeaderstatEntry } = {}
+	for i, entry in entries do
+		assert(typeof(entry) == "table", `leaderstats[{i}] must be a table`)
+		assert(typeof(entry.name) == "string" and #entry.name > 0, `leaderstats[{i}].name must be a non-empty string`)
+		local expectedType = LEADERSTAT_TYPE_TO_LUA[entry.type]
+		assert(expectedType ~= nil, `leaderstats[{i}].type must be IntValue, NumberValue, or StringValue`)
+
+		local path = Shared.resolveKeyPath(entry.path)
+		local pathStr = Shared.toPathString(entry.path)
+		local current = Shared.readPath(template, path)
+		assert(current ~= nil, `leaderstats[{i}].path "{pathStr}" does not exist in template`)
+		assert(
+			typeof(current) == expectedType,
+			`leaderstats[{i}].path "{pathStr}" is {typeof(current)} but declared {entry.type}`
+		)
+
+		table.insert(resolved, {
+			path = path,
+			pathStr = pathStr,
+			name = entry.name,
+			type = entry.type,
+		})
+	end
+	return resolved
+end
+
 --[=[
 	Creates a new server-side store. Binds player join/leave handlers,
 	processes players already in the server, and provisions the replication
@@ -143,6 +254,11 @@ function Server.new(config: Config): Server
 	assert(typeof(config.template) == "table", "config.template must be a table")
 	assert(RunService:IsServer(), "EZProfileStore.Server can only be required on the server")
 
+	local resolvedLeaderstats: { ResolvedLeaderstatEntry } = if config.leaderstats and #config.leaderstats > 0
+		then validateLeaderstats(config.template, config.leaderstats)
+		else {}
+
+	local ProfileStore = getProfileStore()
 	local store = ProfileStore.New(config.storeName, config.template)
 	if config.useMockInStudio and RunService:IsStudio() then
 		store = store.Mock
@@ -158,16 +274,21 @@ function Server.new(config: Config): Server
 		_keyPrefix = config.keyPrefix or DEFAULT_KEY_PREFIX,
 		_profiles = {},
 		_connections = {},
-		_remoteFolder = remoteFolder,
+		_profileConnections = {},
 		_dataUpdate = dataUpdate,
 		_requestData = requestData,
 		_isDestroyed = false,
 		_pendingBatches = {},
 		_flushScheduled = false,
+		_leaderstatsConfig = resolvedLeaderstats,
+		_leaderstats = {},
 		ProfileLoaded = Signal.new(),
 		ProfileReleased = Signal.new(),
 		FirstJoin = Signal.new(),
 		DataUpdated = Signal.new(),
+		PreSave = Signal.new(),
+		PostSave = Signal.new(),
+		LastSave = Signal.new(),
 	}, Server) :: any
 
 	requestData.OnServerInvoke = function(player: Player): { [any]: any }?
@@ -248,6 +369,18 @@ function Server._onPlayerAdded(self: Server, player: Player)
 
 	self._profiles[player] = profile
 
+	self._profileConnections[player] = {
+		profile.OnSave:Connect(function()
+			self.PreSave:Fire(player, profile.Data)
+		end),
+		profile.OnAfterSave:Connect(function(saved)
+			self.PostSave:Fire(player, saved)
+		end),
+		profile.OnLastSave:Connect(function(reason)
+			self.LastSave:Fire(player, reason)
+		end),
+	}
+
 	profile.OnSessionEnd:Connect(function()
 		self._profiles[player] = nil
 		self._pendingBatches[player] = nil
@@ -264,44 +397,116 @@ function Server._onPlayerAdded(self: Server, player: Player)
 	end
 
 	self.ProfileLoaded:Fire(player, profile)
+	self:_buildLeaderstats(player)
 end
 
 function Server._onPlayerRemoving(self: Server, player: Player)
+	self._leaderstats[player] = nil
 	self._pendingBatches[player] = nil
+
+	local profileConns = self._profileConnections[player]
+	if profileConns then
+		for _, conn in profileConns do
+			conn:Disconnect()
+		end
+		self._profileConnections[player] = nil
+	end
+
 	local profile = self._profiles[player]
 	if profile then
 		profile:EndSession()
 	end
 end
 
-function Server._queueUpdate(self: Server, player: Player, pathStr: string, value: any, isInsert: boolean)
+function Server._buildLeaderstats(self: Server, player: Player)
+	if #self._leaderstatsConfig == 0 then
+		return
+	end
+
+	local data = self:GetData(player)
+	if not data then
+		return
+	end
+
+	local folder = Instance.new("Folder")
+	folder.Name = "leaderstats"
+
+	local mirror: { [string]: ValueBase } = {}
+	for _, entry in self._leaderstatsConfig do
+		local instance = Instance.new(entry.type)
+		instance.Name = entry.name
+		instance.Value = Shared.readPath(data, entry.path)
+		instance.Parent = folder
+		mirror[entry.pathStr] = instance
+	end
+
+	self._leaderstats[player] = mirror
+	folder.Parent = player
+end
+
+function Server._mirrorLeaderstats(self: Server, player: Player)
+	local mirror = self._leaderstats[player]
+	if not mirror then
+		return
+	end
+
+	local data = self:GetData(player)
+	if not data then
+		return
+	end
+
+	for _, entry in self._leaderstatsConfig do
+		local instance = mirror[entry.pathStr]
+		if instance then
+			local current = Shared.readPath(data, entry.path)
+			if current ~= nil and instance.Value ~= current then
+				instance.Value = current
+			end
+		end
+	end
+end
+
+function Server._queueUpdate(
+	self: Server,
+	player: Player,
+	opcode: string,
+	pathStr: string,
+	valueOrIndex: any,
+	value: any?
+)
 	local batch = self._pendingBatches[player]
 	if not batch then
 		batch = {}
 		self._pendingBatches[player] = batch
 	end
 
-	if isInsert then
-		local entry: Shared.Update = { pathStr, value, true }
-		table.insert(batch, entry)
-	else
-		local coalesced = false
+	-- Stop at first non-set/del to preserve order against ins/aupd/arm.
+	if opcode == Shared.OP.Set or opcode == Shared.OP.Del then
 		for i = #batch, 1, -1 do
 			local entry = batch[i]
-			if entry[1] == pathStr then
-				if entry[3] == true then
-					-- Don't coalesce past an insert — would reorder ops.
-					break
-				end
-				entry[2] = value
-				coalesced = true
+			local entryOp = entry[1]
+			if entryOp ~= Shared.OP.Set and entryOp ~= Shared.OP.Del then
 				break
 			end
+			if entry[2] == pathStr then
+				entry[1] = opcode
+				entry[3] = valueOrIndex
+				self:_scheduleFlush()
+				return
+			end
 		end
-		if not coalesced then
-			local entry: Shared.Update = if value == nil then { pathStr } else { pathStr, value }
-			table.insert(batch, entry)
-		end
+	end
+
+	if opcode == Shared.OP.Set then
+		table.insert(batch, { Shared.OP.Set, pathStr, valueOrIndex })
+	elseif opcode == Shared.OP.Del then
+		table.insert(batch, { Shared.OP.Del, pathStr })
+	elseif opcode == Shared.OP.Ins then
+		table.insert(batch, { Shared.OP.Ins, pathStr, valueOrIndex })
+	elseif opcode == Shared.OP.AUpd then
+		table.insert(batch, { Shared.OP.AUpd, pathStr, valueOrIndex, value })
+	elseif opcode == Shared.OP.ARm then
+		table.insert(batch, { Shared.OP.ARm, pathStr, valueOrIndex })
 	end
 
 	self:_scheduleFlush()
@@ -327,8 +532,12 @@ function Server._flushUpdates(self: Server)
 	for player, batch in self._pendingBatches do
 		if #batch > 0 and player.Parent == Players then
 			self._dataUpdate:FireClient(player, batch)
+			if self._leaderstats[player] then
+				self:_mirrorLeaderstats(player)
+			end
 		end
 	end
+
 	table.clear(self._pendingBatches)
 end
 
@@ -407,7 +616,8 @@ function Server.UpdateData(self: Server, player: Player, keyPath: Shared.KeyPath
 		return false
 	end
 
-	self:_queueUpdate(player, Shared.toPathString(keyPath), value, false)
+	local opcode = if value == nil then Shared.OP.Del else Shared.OP.Set
+	self:_queueUpdate(player, opcode, Shared.toPathString(keyPath), value)
 	self.DataUpdated:Fire(player, keyPath, value)
 	return true
 end
@@ -435,9 +645,245 @@ function Server.InsertData(self: Server, player: Player, keyPath: Shared.KeyPath
 		return false
 	end
 
-	self:_queueUpdate(player, Shared.toPathString(keyPath), value, true)
+	self:_queueUpdate(player, Shared.OP.Ins, Shared.toPathString(keyPath), value)
 	self.DataUpdated:Fire(player, keyPath, value)
 	return true
+end
+
+--[=[
+	Adds `delta` (default `1`) to the numeric value at `keyPath`. A `nil`
+	current value is treated as `0`. Returns `false` if the profile is not
+	loaded, or the existing value is non-nil and non-numeric (in which case
+	the call warns and is a no-op).
+
+	@within Server
+	@method IncrementData
+	@param player Player
+	@param keyPath KeyPath
+	@param delta number? -- Defaults to `1`.
+	@return boolean
+]=]
+function Server.IncrementData(self: Server, player: Player, keyPath: Shared.KeyPath, delta: number?): boolean
+	local data = self:GetData(player)
+	if not data then
+		return false
+	end
+
+	local path = Shared.resolveKeyPath(keyPath)
+	local current = Shared.readPath(data, path)
+	if current ~= nil and typeof(current) ~= "number" then
+		warn(`EZProfileStore: IncrementData target at "{table.concat(path, ".")}" is not a number`)
+		return false
+	end
+
+	local newValue = (current or 0) + (delta or 1)
+	if not Shared.writePath(data, path, newValue, false) then
+		return false
+	end
+
+	self:_queueUpdate(player, Shared.OP.Set, Shared.toPathString(keyPath), newValue)
+	self.DataUpdated:Fire(player, keyPath, newValue)
+	return true
+end
+
+--[=[
+	Subtracts `delta` (default `1`) from the numeric value at `keyPath`.
+	Equivalent to `IncrementData(player, keyPath, -(delta or 1))`.
+
+	@within Server
+	@method DecrementData
+	@param player Player
+	@param keyPath KeyPath
+	@param delta number? -- Defaults to `1`.
+	@return boolean
+]=]
+function Server.DecrementData(self: Server, player: Player, keyPath: Shared.KeyPath, delta: number?): boolean
+	return self:IncrementData(player, keyPath, -(delta or 1))
+end
+
+--[=[
+	Sets the value at `keyPath` to `nil`. Returns `false` when no profile is
+	loaded or the path is already `nil` (no-op, no replication).
+
+	@within Server
+	@method RemoveData
+	@param player Player
+	@param keyPath KeyPath
+	@return boolean
+]=]
+function Server.RemoveData(self: Server, player: Player, keyPath: Shared.KeyPath): boolean
+	local data = self:GetData(player)
+	if not data then
+		return false
+	end
+
+	local path = Shared.resolveKeyPath(keyPath)
+	if Shared.readPath(data, path) == nil then
+		return false
+	end
+
+	if not Shared.writePath(data, path, nil, false) then
+		return false
+	end
+
+	self:_queueUpdate(player, Shared.OP.Del, Shared.toPathString(keyPath))
+	self.DataUpdated:Fire(player, keyPath, nil)
+	return true
+end
+
+--[=[
+	Replaces the array element at `index` (1-based) under `arrayPath`.
+	Returns `false` if the profile is not loaded, the target is not an array,
+	or `index` is out of bounds (`< 1` or `> #arr`).
+
+	@within Server
+	@method UpdateArrayItem
+	@param player Player
+	@param arrayPath KeyPath -- Path to the array.
+	@param index number
+	@param value any
+	@return boolean
+]=]
+function Server.UpdateArrayItem(
+	self: Server,
+	player: Player,
+	arrayPath: Shared.KeyPath,
+	index: number,
+	value: any
+): boolean
+	local data = self:GetData(player)
+	if not data then
+		return false
+	end
+
+	local path = Shared.resolveKeyPath(arrayPath)
+	if not Shared.arrayUpdate(data, path, index, value) then
+		return false
+	end
+
+	self:_queueUpdate(player, Shared.OP.AUpd, Shared.toPathString(arrayPath), index, value)
+	self.DataUpdated:Fire(player, arrayPath, value)
+	return true
+end
+
+--[=[
+	Removes the array element at `index` (1-based) under `arrayPath` via
+	`table.remove`. Returns `false` if the profile is not loaded, the target
+	is not an array, or `index` is out of bounds.
+
+	@within Server
+	@method RemoveArrayItem
+	@param player Player
+	@param arrayPath KeyPath
+	@param index number
+	@return boolean
+]=]
+function Server.RemoveArrayItem(self: Server, player: Player, arrayPath: Shared.KeyPath, index: number): boolean
+	local data = self:GetData(player)
+	if not data then
+		return false
+	end
+
+	local path = Shared.resolveKeyPath(arrayPath)
+	if not Shared.arrayRemove(data, path, index) then
+		return false
+	end
+
+	self:_queueUpdate(player, Shared.OP.ARm, Shared.toPathString(arrayPath), index)
+	self.DataUpdated:Fire(player, arrayPath, nil)
+	return true
+end
+
+--[=[
+	Applies multiple set/del writes to the player's profile in one frame.
+	Each entry's `value` follows the same semantics as `UpdateData`: `nil`
+	deletes, anything else sets. Returns the count of paths that actually
+	changed (no-ops are not counted).
+
+	All wire entries from a single call will batch into the same network
+	event since they're queued before the next deferred flush.
+
+	@within Server
+	@method BatchSetValues
+	@param player Player
+	@param writes { { path: KeyPath, value: any } }
+	@return number
+]=]
+function Server.BatchSetValues(self: Server, player: Player, writes: { { path: Shared.KeyPath, value: any } }): number
+	local data = self:GetData(player)
+	if not data then
+		return 0
+	end
+
+	local changed = 0
+	for _, write in writes do
+		local path = Shared.resolveKeyPath(write.path)
+		if Shared.writePath(data, path, write.value, false) then
+			local opcode = if write.value == nil then Shared.OP.Del else Shared.OP.Set
+			self:_queueUpdate(player, opcode, Shared.toPathString(write.path), write.value)
+			self.DataUpdated:Fire(player, write.path, write.value)
+			changed += 1
+		end
+	end
+	return changed
+end
+
+--[=[
+	Forces an immediate save via `profile:Save()`. Returns `false` when no
+	profile is loaded for `player`.
+
+	@within Server
+	@method SaveAsync
+	@yields
+	@param player Player
+	@return boolean
+]=]
+function Server.SaveAsync(self: Server, player: Player): boolean
+	local profile = self._profiles[player]
+	if not profile then
+		return false
+	end
+	profile:Save()
+	return true
+end
+
+--[=[
+	Returns `true` when a profile is loaded for `player`.
+
+	@within Server
+	@method IsReady
+	@param player Player
+	@return boolean
+]=]
+function Server.IsReady(self: Server, player: Player): boolean
+	return self._profiles[player] ~= nil
+end
+
+--[=[
+	Removes the player's stored data via `ProfileStore:RemoveAsync`. Accepts
+	either a `Player` (whose active session, if any, is ended first) or a raw
+	`UserId` (offline wipe).
+
+	@within Server
+	@method WipeAsync
+	@yields
+	@param target Player | number
+	@return boolean
+]=]
+function Server.WipeAsync(self: Server, target: Player | number): boolean
+	local userId: number
+	if typeof(target) == "Instance" then
+		userId = target.UserId
+		local profile = self._profiles[target]
+		if profile then
+			profile:EndSession()
+		end
+	else
+		userId = target
+	end
+
+	local key = self._keyPrefix .. tostring(userId)
+	return self._store:RemoveAsync(key)
 end
 
 --[=[
@@ -458,6 +904,13 @@ function Server.Destroy(self: Server)
 	end
 	table.clear(self._connections)
 
+	for _, conns in self._profileConnections do
+		for _, conn in conns do
+			conn:Disconnect()
+		end
+	end
+	table.clear(self._profileConnections)
+
 	for player, profile in self._profiles do
 		profile:EndSession()
 		self._profiles[player] = nil
@@ -472,6 +925,9 @@ function Server.Destroy(self: Server)
 	self.ProfileReleased:Destroy()
 	self.FirstJoin:Destroy()
 	self.DataUpdated:Destroy()
+	self.PreSave:Destroy()
+	self.PostSave:Destroy()
+	self.LastSave:Destroy()
 end
 
 return Server

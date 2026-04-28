@@ -1,4 +1,4 @@
-std = "roblox"
+std = "roblox+testez"
 
 [config]
 shadowing = { ignore_pattern = "_" }

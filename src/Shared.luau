@@ -14,12 +14,22 @@ Shared.REMOTE_FOLDER_NAME = "_EZProfileStore"
 Shared.REMOTE_DATA_UPDATE = "DataUpdate"
 Shared.REMOTE_REQUEST_DATA = "RequestData"
 
+Shared.OP = table.freeze({
+	Set = "set",
+	Del = "del",
+	Ins = "ins",
+	AUpd = "aupd",
+	ARm = "arm",
+})
+
 export type KeyPath = string | { string }
 
--- Wire-format tuple per replicated update:
---   { pathString }              → delete
---   { pathString, value }       → set
---   { pathString, value, true } → table.insert into array at path
+-- Wire-format tuple per replicated update (opcode-first):
+--   { "set",  pathString, value }
+--   { "del",  pathString }
+--   { "ins",  pathString, value }
+--   { "aupd", pathString, index, value }
+--   { "arm",  pathString, index }
 export type Update = { any }
 export type Batch = { Update }
 
@@ -126,6 +136,63 @@ function Shared.writePath(root: any, path: { string }, value: any, isInsert: boo
 	return true
 end
 
+local function navigateToTable(root: any, path: { string }): any?
+	local target: any = root
+	for _, key in path do
+		if typeof(target) ~= "table" then
+			return nil
+		end
+		target = target[key]
+	end
+	if typeof(target) ~= "table" then
+		return nil
+	end
+	return target
+end
+
+--[=[
+	Replaces `arr[index]` at the array under `path`. Returns `false` when the
+	target is missing/not a table, the index is out of bounds, or the path is empty.
+
+	@private
+]=]
+function Shared.arrayUpdate(root: any, path: { string }, index: number, value: any): boolean
+	if #path == 0 then
+		return false
+	end
+	local arr = navigateToTable(root, path)
+	if arr == nil then
+		return false
+	end
+	if index < 1 or index > #arr then
+		return false
+	end
+	arr[index] = value
+	return true
+end
+
+--[=[
+	Calls `table.remove(arr, index)` on the array under `path`. Returns `false`
+	when the target is missing/not a table, the index is out of bounds, or the
+	path is empty.
+
+	@private
+]=]
+function Shared.arrayRemove(root: any, path: { string }, index: number): boolean
+	if #path == 0 then
+		return false
+	end
+	local arr = navigateToTable(root, path)
+	if arr == nil then
+		return false
+	end
+	if index < 1 or index > #arr then
+		return false
+	end
+	table.remove(arr, index)
+	return true
+end
+
 --[=[
 	Returns a new root with the spine along `path` shallow-cloned and the
 	value written at the leaf. Sibling subtrees keep reference identity so
@@ -159,6 +226,84 @@ function Shared.writePathSpine<T>(root: T, path: { string }, value: any, isInser
 	else
 		target[finalKey] = value
 	end
+
+	return newRoot :: T
+end
+
+--[=[
+	Spine-clones the path down to the array, then replaces `arr[index]`.
+	Returns the original root (reference-equal) when the target is missing,
+	the index is out of bounds, or the path is empty.
+
+	@private
+]=]
+function Shared.arrayUpdateSpine<T>(root: T, path: { string }, index: number, value: any): T
+	if #path == 0 then
+		return root
+	end
+
+	local existing: any = root
+	for _, key in path do
+		if typeof(existing) ~= "table" then
+			return root
+		end
+		existing = existing[key]
+	end
+	if typeof(existing) ~= "table" or index < 1 or index > #existing then
+		return root
+	end
+
+	local newRoot: any = if typeof(root) == "table" then table.clone(root :: any) else {}
+	local target: any = newRoot
+	for i = 1, #path - 1 do
+		local key = path[i]
+		target[key] = table.clone(target[key])
+		target = target[key]
+	end
+
+	local finalKey = path[#path]
+	local newArr = table.clone(target[finalKey])
+	newArr[index] = value
+	target[finalKey] = newArr
+
+	return newRoot :: T
+end
+
+--[=[
+	Spine-clones the path down to the array, then `table.remove`s at `index`.
+	Returns the original root (reference-equal) when the target is missing,
+	the index is out of bounds, or the path is empty.
+
+	@private
+]=]
+function Shared.arrayRemoveSpine<T>(root: T, path: { string }, index: number): T
+	if #path == 0 then
+		return root
+	end
+
+	local existing: any = root
+	for _, key in path do
+		if typeof(existing) ~= "table" then
+			return root
+		end
+		existing = existing[key]
+	end
+	if typeof(existing) ~= "table" or index < 1 or index > #existing then
+		return root
+	end
+
+	local newRoot: any = if typeof(root) == "table" then table.clone(root :: any) else {}
+	local target: any = newRoot
+	for i = 1, #path - 1 do
+		local key = path[i]
+		target[key] = table.clone(target[key])
+		target = target[key]
+	end
+
+	local finalKey = path[#path]
+	local newArr = table.clone(target[finalKey])
+	table.remove(newArr, index)
+	target[finalKey] = newArr
 
 	return newRoot :: T
 end

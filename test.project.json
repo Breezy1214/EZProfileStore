@@ -1,9 +1,12 @@
 {
-  "name": "EZProfileStore-Dev",
+  "name": "EZProfileStore-Test",
   "tree": {
     "$className": "DataModel",
     "ReplicatedStorage": {
       "$className": "ReplicatedStorage",
+      "DevPackages": {
+        "$path": "DevPackages"
+      },
       "Packages": {
         "EZProfileStore": {
           "$path": "src"
@@ -15,6 +18,12 @@
       "$className": "ServerScriptService",
       "ServerPackages": {
         "$path": "ServerPackages"
+      },
+      "TestRunner": {
+        "$path": "tests/Runner.server.luau"
+      },
+      "Tests": {
+        "$path": "tests/specs"
       }
     }
   }
