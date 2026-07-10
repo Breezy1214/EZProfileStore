@@ -377,12 +377,34 @@ return function()
 			expect(server:IsReady(player)).to.equal(false)
 			server:Destroy()
 		end)
+
+		it("returns false after ProfileStore reports the session inactive", function()
+			local server = makeServer()
+			local player = makeFakePlayer()
+			local profile = seed(server, player, {})
+			profile.IsActive = function()
+				return false
+			end
+
+			expect(server:IsReady(player)).to.equal(false)
+			expect(server:GetData(player)).to.equal(nil)
+			expect(server:GetProfileAsync(player, 0.01)).to.equal(nil)
+			expect(server:GetDataAsync(player, 0.01)).to.equal(nil)
+
+			server:Destroy()
+		end)
 	end)
 
 	describe("Server:WipeAsync", function()
 		it("accepts a userId number", function()
 			local server = makeServer()
 			expect(server:WipeAsync(99999)).to.equal(true)
+			server:Destroy()
+		end)
+
+		it("accepts negative mock UserIds", function()
+			local server = makeServer()
+			expect(server:WipeAsync(-42)).to.equal(true)
 			server:Destroy()
 		end)
 	end)
@@ -544,6 +566,242 @@ return function()
 			server:_mirrorLeaderstats(player)
 
 			expect(server._leaderstats[player]["Stats.Wins"].Value).to.equal(7)
+
+			server:Destroy()
+		end)
+	end)
+
+	describe("Server developer experience helpers", function()
+		local function makeInjectedStore()
+			local savedVersion = nil
+			local currentProfile = nil
+			local versions = {
+				{
+					Data = { Coins = 300 },
+					KeyInfo = { Version = "v3", UpdatedTime = 3000 },
+				},
+				{
+					Data = { Coins = 200 },
+					KeyInfo = { Version = "v2", UpdatedTime = 2000 },
+				},
+				{
+					Data = { Coins = 100 },
+					KeyInfo = { Version = "v1", UpdatedTime = 1000 },
+				},
+			}
+			currentProfile = versions[1]
+			for _, profile in versions do
+				profile.RobloxMetaData = {}
+				profile.UserIds = {}
+				profile.SetAsync = function(self)
+					savedVersion = self.KeyInfo.Version
+					currentProfile = self
+				end
+			end
+
+			local store = {}
+			function store:VersionQuery()
+				local index = 0
+				return {
+					NextAsync = function()
+						index += 1
+						return versions[index]
+					end,
+				}
+			end
+			function store:GetAsync(_key, version)
+				if version == nil then
+					return currentProfile
+				end
+				for _, profile in versions do
+					if profile.KeyInfo.Version == version then
+						return profile
+					end
+				end
+				return nil
+			end
+			function store:RemoveAsync()
+				return true
+			end
+
+			return store, function()
+				return savedVersion
+			end
+		end
+
+		it("creates an explicitly isolated mock store", function()
+			local server = Server.mock({
+				storeName = "ForcedMock_" .. tostring(math.random(1, 1e9)),
+				template = { Coins = 0 },
+			})
+
+			expect(server.IsMock).to.equal(true)
+			server:Destroy()
+		end)
+
+		it("accepts an injected store and exposes deterministic keys", function()
+			local injected = makeInjectedStore()
+			local server = Server.new({
+				storeName = "Injected",
+				template = {},
+				store = injected,
+				keyPrefix = "Account_",
+			})
+
+			expect(server:GetStore()).to.equal(injected)
+			expect(server:GetKey(42)).to.equal("Account_42")
+			expect(server:GetKey("Shared_Guild")).to.equal("Shared_Guild")
+
+			server:Destroy()
+		end)
+
+		it("rejects ambiguous backend injection", function()
+			local injected = makeInjectedStore()
+			local bothOk = pcall(function()
+				Server.new({
+					storeName = "Ambiguous",
+					template = {},
+					store = injected,
+					profileStore = {},
+				})
+			end)
+			local mockOk = pcall(function()
+				Server.new({
+					storeName = "AmbiguousMock",
+					template = {},
+					store = injected,
+					mode = "mock",
+				})
+			end)
+
+			expect(bothOk).to.equal(false)
+			expect(mockOk).to.equal(false)
+		end)
+
+		it("previews the previous save by default and rolls back exact versions", function()
+			local injected, getSavedVersion = makeInjectedStore()
+			local server = Server.new({
+				storeName = "Rollback",
+				template = {},
+				store = injected,
+			})
+
+			local preview = server:PreviewRollbackAsync(42)
+			expect(preview.version).to.equal("v2")
+			expect(preview.data.Coins).to.equal(200)
+
+			local fired = false
+			server.RolledBack:Connect(function(result)
+				fired = result.version == "v1"
+			end)
+			local exactPreview = server:PreviewRollbackAsync(42, { version = "v1" })
+			expect(exactPreview.profile).to.equal(nil)
+			exactPreview.data.Coins = 999 -- preview data is detached from the stored profile
+			local applied = server:ApplyRollbackAsync(exactPreview)
+			expect(applied.version).to.equal("v1")
+			expect(applied.data.Coins).to.equal(100)
+			expect(getSavedVersion()).to.equal("v1")
+			expect(fired).to.equal(true)
+			expect(pcall(function()
+				server:ApplyRollbackAsync(exactPreview)
+			end)).to.equal(false)
+
+			server:Destroy()
+		end)
+
+		it("retires a matching live session before reporting rollback completion", function()
+			local injected = makeInjectedStore()
+			local server = Server.new({
+				storeName = "OnlineRollback",
+				template = {},
+				store = injected,
+			})
+			local player = makeFakePlayer()
+			local live = makeFakeProfile({ Coins = 999 })
+			live.Key = "Player_42"
+			local ended = false
+			live.EndSession = function()
+				ended = true
+				live.OnSessionEnd:Fire()
+				live.OnAfterSave:Fire(live.Data)
+			end
+			server._profiles[player] = live
+			server._profileConnections[player] = {
+				live.OnSessionEnd:Connect(function()
+					server:_releaseProfile(player, live, false)
+				end),
+			}
+
+			local result = server:RollbackAsync(42, { version = "v1" })
+
+			expect(result.version).to.equal("v1")
+			expect(ended).to.equal(true)
+			expect(server._profiles[player]).to.equal(nil)
+
+			server:Destroy()
+		end)
+
+		it("keeps a preview reusable when rollback verification fails", function()
+			local injected = makeInjectedStore()
+			local historical = injected:GetAsync("Player_42", "v1")
+			historical.SetAsync = function() end
+			local server = Server.new({
+				storeName = "FailedRollback",
+				template = {},
+				store = injected,
+			})
+			local preview = server:PreviewRollbackAsync(42, { version = "v1" })
+
+			expect(pcall(function()
+				server:ApplyRollbackAsync(preview)
+			end)).to.equal(false)
+			expect(server._rollbackPreviews[preview]).to.be.ok()
+
+			server:Destroy()
+		end)
+
+		it("tracks migrations in profile metadata and skips history for new profiles", function()
+			local injected = makeInjectedStore()
+			local server = Server.new({
+				storeName = "Migrations",
+				template = {},
+				store = injected,
+				migrations = {
+					{
+						name = "coins",
+						up = function(data)
+							data.Currency = data.Currency or {}
+							data.Currency.Coins = data.Currency.Coins or data.LegacyCoins or 0
+							data.LegacyCoins = nil
+						end,
+					},
+				},
+			})
+			local player = makeFakePlayer()
+			local oldProfile = {
+				Data = { LegacyCoins = 25 },
+				RobloxMetaData = {},
+				SessionLoadCount = 3,
+				Reconcile = function(self)
+					self.Data.Currency = self.Data.Currency or {}
+					self.Data.Currency.Coins = self.Data.Currency.Coins or 0
+				end,
+			}
+			local newProfile = {
+				Data = { LegacyCoins = 50 },
+				RobloxMetaData = {},
+				SessionLoadCount = 1,
+			}
+
+			local ok = server:_prepareProfile(player, oldProfile, "Player_1")
+			local newOk = server:_migrateProfile(player, newProfile, "Player_2")
+
+			expect(ok).to.equal(true)
+			expect(oldProfile.Data.Currency.Coins).to.equal(25)
+			expect(oldProfile.RobloxMetaData.EZProfileStoreVersion).to.equal(1)
+			expect(newOk).to.equal(true)
+			expect(newProfile.Data.LegacyCoins).to.equal(50)
+			expect(newProfile.RobloxMetaData.EZProfileStoreVersion).to.equal(1)
 
 			server:Destroy()
 		end)

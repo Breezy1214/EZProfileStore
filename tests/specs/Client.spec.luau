@@ -20,7 +20,7 @@ local function makeClient(initial: { [any]: any }?): any
 		_isDestroyed = false,
 		Updated = Signal.new(),
 	}, { __index = Client })
-	
+
 	self._rejectReady = function(reason)
 		self._rejectedReason = reason
 	end

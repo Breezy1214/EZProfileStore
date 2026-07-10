@@ -44,5 +44,10 @@ return function()
 
 			expect(typeof(serverModule.new)).to.equal("function")
 		end)
+
+		it("lazily exposes the migration runner", function()
+			local EZProfileStore = require(PackageAlias)
+			expect(typeof(EZProfileStore.Migrations.new)).to.equal("function")
+		end)
 	end)
 end

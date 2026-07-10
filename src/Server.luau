@@ -3,106 +3,124 @@
 	@class Server
 	@server
 
-	Owns ProfileStore sessions for players, exposes path-based mutation helpers, and replicates server-side changes to each player's client mirror.
-
-	`Server.new` connects `Players.PlayerAdded` and `Players.PlayerRemoving` for you. Mutations made through `UpdateData`, `InsertData`, `IncrementData`, `DecrementData`, `RemoveData`, `UpdateArrayItem`, `RemoveArrayItem`, and `BatchSetValues` are persisted through ProfileStore and replicated to the owning client.
-
-	```lua
-	local EZProfileStore = require(Path.To.EZProfileStore)
-
-	local store = EZProfileStore.Server.new({
-		storeName = "PlayerData_v1",
-		template = { Coins = 0, Inventory = {} },
-	})
-
-	store.ProfileLoaded:Connect(function(player, profile)
-		print(player.Name, "loaded")
-	end)
-
-	store:UpdateData(player, "Coins", 100)
-	store:UpdateData(player, { "Inventory", "SwordOfTruth" }, true)
-	store:InsertData(player, "Inventory", "Potion")
-	```
+	Owns player sessions and replicates server mutations.
 ]=]
 
 --[=[
 	@interface Config
 	@within Server
-	.storeName string -- Name passed to `ProfileStore.New`.
-	.template { [any]: any } -- Default profile data passed to `ProfileStore.New`.
-	.keyPrefix string? -- Profile key prefix. Defaults to `"Player_"`.
-	.useMockInStudio boolean? -- Use `ProfileStore.Mock` in Studio.
-	.remoteParent Instance? -- Parent for the replication folder. Defaults to `ReplicatedStorage`.
-	.leaderstats { LeaderstatEntry }? -- Profile paths to mirror into `Player.leaderstats`.
+	.storeName string -- ProfileStore name.
+	.template { [any]: any } -- Current data template.
+	.keyPrefix string? -- Defaults to `"Player_"`.
+	.mode "live" | "studio" | "mock"? -- Defaults to `"live"`.
+	.useMockInStudio boolean? -- Alias for `mode = "studio"`.
+	.store any? -- Injected store for tests.
+	.profileStore any? -- Injected ProfileStore module.
+	.migrations Migrations | { MigrationInput }? -- Ordered migrations.
+	.migrateNewProfiles boolean? -- Defaults to `false`.
+	.migrationMetadataKey string? -- Defaults to `"EZProfileStoreVersion"`.
+	.remoteParent Instance? -- Defaults to `ReplicatedStorage`.
+	.leaderstats { LeaderstatEntry }? -- Mirrored profile paths.
 ]=]
 
 --[=[
 	@interface LeaderstatEntry
 	@within Server
-	.path KeyPath -- Profile data path to mirror.
-	.name string -- Value object name under `Player.leaderstats`.
-	.type "IntValue" | "NumberValue" | "StringValue" -- Value object class.
+	.path KeyPath
+	.name string
+	.type "IntValue" | "NumberValue" | "StringValue"
 ]=]
 
 --[=[
 	@prop ProfileLoaded Signal<Player, Profile>
 	@within Server
-
-	Fires after a player's profile loads, receives `AddUserId`, and is reconciled. The `profile` argument is the live ProfileStore profile.
+	Fires when a profile is ready.
 ]=]
 
 --[=[
 	@prop ProfileReleased Signal<Player>
 	@within Server
-
-	Fires when EZProfileStore releases a player's profile session.
+	Fires when a session ends.
 ]=]
 
 --[=[
 	@prop FirstJoin Signal<Player, { [any]: any }>
 	@within Server
-
-	Fires when `profile.SessionLoadCount == 1`. The data table is the freshly reconciled profile data and may be mutated synchronously to seed defaults.
+	Fires on the first profile session.
 ]=]
 
 --[=[
 	@prop DataUpdated Signal<Player, KeyPath, any>
 	@within Server
-
-	Fires after a replicated mutation succeeds. The path is the same path value passed to the mutation method.
+	Fires after a replicated mutation.
 ]=]
 
 --[=[
 	@prop PreSave Signal<Player, { [any]: any }>
 	@within Server
-
-	Forwards `Profile.OnSave` with the live data table. Handlers should not yield before making final synchronous changes.
+	Forwards `Profile.OnSave`.
 ]=]
 
 --[=[
 	@prop PostSave Signal<Player, { [any]: any }>
 	@within Server
-
-	Forwards `Profile.OnAfterSave` with the saved data snapshot.
+	Forwards `Profile.OnAfterSave`.
 ]=]
 
 --[=[
 	@prop LastSave Signal<Player, "Manual" | "External" | "Shutdown">
 	@within Server
+	Forwards `Profile.OnLastSave`.
+]=]
 
-	Forwards `Profile.OnLastSave` with ProfileStore's final-save reason.
+--[=[
+	@prop Migrated Signal<Player, MigrationReport>
+	@within Server
+	Fires after migrations run.
+]=]
+
+--[=[
+	@prop ProfileLoadFailed Signal<Player, string>
+	@within Server
+	Fires when loading or migration fails.
+]=]
+
+--[=[
+	@prop RolledBack Signal<RollbackResult>
+	@within Server
+	Fires after a rollback.
 ]=]
 
 local Players = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local RunService = game:GetService("RunService")
 
+local Migrations = require(script.Parent.Migrations)
 local Promise = require(script.Parent.Parent.Promise)
 local Shared = require(script.Parent.Shared)
 local Signal = require(script.Parent.Parent.Signal)
 
 local DEFAULT_KEY_PREFIX = "Player_"
+local DEFAULT_MIGRATION_METADATA_KEY = "EZProfileStoreVersion"
 local SNAPSHOT_WAIT_TIMEOUT = 30
+
+export type StoreMode = "live" | "studio" | "mock"
+export type Target = Player | number | string
+export type VersionSelector = {
+	version: string?,
+	before: DateTime | number?,
+	stepsBack: number?,
+}
+export type RollbackResult = {
+	key: string,
+	version: string,
+	updatedTime: number,
+	data: { [any]: any },
+}
+type RollbackSelection = {
+	key: string,
+	profile: any,
+}
 
 export type LeaderstatEntry = {
 	path: Shared.KeyPath,
@@ -121,7 +139,13 @@ export type Config = {
 	storeName: string,
 	template: { [any]: any },
 	keyPrefix: string?,
+	mode: StoreMode?,
 	useMockInStudio: boolean?,
+	store: any?,
+	profileStore: any?,
+	migrations: Migrations.Migrations | { Migrations.Input }?,
+	migrateNewProfiles: boolean?,
+	migrationMetadataKey: string?,
 	remoteParent: Instance?,
 	leaderstats: { LeaderstatEntry }?,
 }
@@ -132,9 +156,13 @@ export type Server = typeof(setmetatable(
 	{} :: {
 		_store: any,
 		_keyPrefix: string,
+		_migrations: Migrations.Migrations?,
+		_migrateNewProfiles: boolean,
+		_migrationMetadataKey: string,
 		_profiles: { [Player]: Profile },
 		_connections: { RBXScriptConnection },
 		_profileConnections: { [Player]: { RBXScriptConnection } },
+		_destroyedSignal: Signal.Signal<>,
 		_dataUpdate: RemoteEvent,
 		_requestData: RemoteFunction,
 		_isDestroyed: boolean,
@@ -142,6 +170,8 @@ export type Server = typeof(setmetatable(
 		_flushScheduled: boolean,
 		_leaderstatsConfig: { ResolvedLeaderstatEntry },
 		_leaderstats: { [Player]: { [string]: ValueBase } },
+		_rollbackPreviews: { [RollbackResult]: RollbackSelection },
+		IsMock: boolean,
 		ProfileLoaded: Signal.Signal<Player, Profile>,
 		ProfileReleased: Signal.Signal<Player>,
 		FirstJoin: Signal.Signal<Player, { [any]: any }>,
@@ -149,6 +179,9 @@ export type Server = typeof(setmetatable(
 		PreSave: Signal.Signal<Player, { [any]: any }>,
 		PostSave: Signal.Signal<Player, { [any]: any }>,
 		LastSave: Signal.Signal<Player, "Manual" | "External" | "Shutdown">,
+		Migrated: Signal.Signal<Player, Migrations.Report>,
+		ProfileLoadFailed: Signal.Signal<Player, string>,
+		RolledBack: Signal.Signal<RollbackResult>,
 	},
 	{} :: { __index: any }
 ))
@@ -269,13 +302,33 @@ local function validateLeaderstats(template: { [any]: any }, entries: { Leaderst
 	return resolved
 end
 
---[=[
-	Creates a new server-side store. Binds player join/leave handlers,
-	processes players already in the server, and provisions the replication
-	remotes under `config.remoteParent` (defaults to `ReplicatedStorage`).
-	Use `useMockInStudio = true` to opt into `ProfileStore.Mock` while testing
-	in Studio.
+local function resolveMigrations(configured: Migrations.Migrations | { Migrations.Input }?): Migrations.Migrations?
+	if configured == nil then
+		return nil
+	end
 
+	if
+		typeof((configured :: any).Migrate) == "function"
+		and typeof((configured :: any).GetLatestVersion) == "function"
+	then
+		return configured :: Migrations.Migrations
+	end
+
+	return Migrations.new(configured :: { Migrations.Input })
+end
+
+local function resolveMode(config: Config): StoreMode
+	local mode: StoreMode = config.mode or (if config.useMockInStudio then "studio" else "live")
+	assert(mode == "live" or mode == "studio" or mode == "mock", 'config.mode must be "live", "studio", or "mock"')
+	return mode
+end
+
+local function isProfileActive(profile: Profile?): boolean
+	return profile ~= nil and (typeof(profile.IsActive) ~= "function" or profile:IsActive())
+end
+
+--[=[
+	Creates a store and binds player lifecycle handlers.
 	@within Server
 	@param config Config
 	@return Server
@@ -285,15 +338,40 @@ function Server.new(config: Config): Server
 	assert(typeof(config.storeName) == "string", "config.storeName must be a string")
 	assert(typeof(config.template) == "table", "config.template must be a table")
 	assert(RunService:IsServer(), "EZProfileStore.Server can only be required on the server")
+	assert(
+		config.migrationMetadataKey == nil or typeof(config.migrationMetadataKey) == "string",
+		"config.migrationMetadataKey must be a string"
+	)
+	assert(
+		config.migrationMetadataKey == nil or #config.migrationMetadataKey > 0,
+		"config.migrationMetadataKey must not be empty"
+	)
 
 	local resolvedLeaderstats: { ResolvedLeaderstatEntry } = if config.leaderstats and #config.leaderstats > 0
 		then validateLeaderstats(config.template, config.leaderstats)
 		else {}
+	local migrationRunner = resolveMigrations(config.migrations)
+	local mode = resolveMode(config)
+	local wantsMock = mode == "mock" or (mode == "studio" and RunService:IsStudio())
+	assert(
+		not (config.store ~= nil and config.profileStore ~= nil),
+		"config.store and config.profileStore are mutually exclusive"
+	)
+	assert(
+		not (config.store ~= nil and mode ~= "live"),
+		"an injected config.store cannot be combined with studio/mock mode"
+	)
 
-	local ProfileStore = getProfileStore()
-	local store = ProfileStore.New(config.storeName, config.template)
-	if config.useMockInStudio and RunService:IsStudio() then
-		store = store.Mock
+	local store = config.store
+	local isMock = config.store == nil and wantsMock
+	if store == nil then
+		local ProfileStore = config.profileStore or getProfileStore()
+		assert(typeof(ProfileStore.New) == "function", "config.profileStore must expose ProfileStore.New")
+		store = ProfileStore.New(config.storeName, config.template)
+		if isMock then
+			assert(store.Mock ~= nil, "ProfileStore-compatible store has no Mock store")
+			store = store.Mock
+		end
 	end
 
 	local remoteParent = config.remoteParent or ReplicatedStorage
@@ -304,9 +382,13 @@ function Server.new(config: Config): Server
 	local self = setmetatable({
 		_store = store,
 		_keyPrefix = config.keyPrefix or DEFAULT_KEY_PREFIX,
+		_migrations = migrationRunner,
+		_migrateNewProfiles = config.migrateNewProfiles == true,
+		_migrationMetadataKey = config.migrationMetadataKey or DEFAULT_MIGRATION_METADATA_KEY,
 		_profiles = {},
 		_connections = {},
 		_profileConnections = {},
+		_destroyedSignal = Signal.new(),
 		_dataUpdate = dataUpdate,
 		_requestData = requestData,
 		_isDestroyed = false,
@@ -314,6 +396,8 @@ function Server.new(config: Config): Server
 		_flushScheduled = false,
 		_leaderstatsConfig = resolvedLeaderstats,
 		_leaderstats = {},
+		_rollbackPreviews = setmetatable({}, { __mode = "k" }),
+		IsMock = isMock,
 		ProfileLoaded = Signal.new(),
 		ProfileReleased = Signal.new(),
 		FirstJoin = Signal.new(),
@@ -321,6 +405,9 @@ function Server.new(config: Config): Server
 		PreSave = Signal.new(),
 		PostSave = Signal.new(),
 		LastSave = Signal.new(),
+		Migrated = Signal.new(),
+		ProfileLoadFailed = Signal.new(),
+		RolledBack = Signal.new(),
 	}, Server) :: any
 
 	requestData.OnServerInvoke = function(player: Player): { [any]: any }?
@@ -350,27 +437,51 @@ function Server.new(config: Config): Server
 	return self
 end
 
-function Server._waitForData(self: Server, player: Player): { [any]: any }?
-	if self._isDestroyed then
+--[=[
+	Creates a store backed by `ProfileStore.Mock`.
+	@within Server
+	@param config Config
+	@return Server
+]=]
+function Server.mock(config: Config): Server
+	assert(typeof(config) == "table", "Server.mock expects a config table")
+	local resolved = table.clone(config)
+	resolved.mode = "mock"
+	resolved.useMockInStudio = nil
+	return Server.new(resolved)
+end
+
+function Server._waitForProfile(self: Server, player: Player, timeout: number): Profile?
+	local profile = self._profiles[player]
+	if isProfileActive(profile) then
+		return profile
+	end
+	if self._isDestroyed or player.Parent ~= Players then
 		return nil
 	end
 
-	local profile = self._profiles[player]
-	if profile then
-		return self:_consumeSnapshot(player, profile)
-	end
-
-	local ok = Promise.fromEvent(self.ProfileLoaded, function(loadedPlayer)
+	local loaded = Promise.fromEvent(self.ProfileLoaded, function(loadedPlayer)
 		return loadedPlayer == player
-	end)
-		:timeout(SNAPSHOT_WAIT_TIMEOUT)
-		:await()
+	end):andThenReturn("loaded")
+	local failed = Promise.fromEvent(self.ProfileLoadFailed, function(failedPlayer)
+		return failedPlayer == player
+	end):andThenReturn("failed")
+	local leaving = Promise.fromEvent(Players.PlayerRemoving, function(leavingPlayer)
+		return leavingPlayer == player
+	end):andThenReturn("left")
+	local destroying = Promise.fromEvent(self._destroyedSignal):andThenReturn("destroyed")
 
-	if not ok or self._isDestroyed or player.Parent ~= Players then
+	local ok, outcome = Promise.race({ loaded, failed, leaving, destroying }):timeout(timeout):await()
+	if not ok or outcome ~= "loaded" then
 		return nil
 	end
 
 	profile = self._profiles[player]
+	return if isProfileActive(profile) then profile else nil
+end
+
+function Server._waitForData(self: Server, player: Player): { [any]: any }?
+	local profile = self:_waitForProfile(player, SNAPSHOT_WAIT_TIMEOUT)
 	return if profile then self:_consumeSnapshot(player, profile) else nil
 end
 
@@ -407,12 +518,64 @@ function Server._releaseProfile(self: Server, player: Player, profile: Profile, 
 	end
 end
 
+function Server._migrateProfile(self: Server, player: Player, profile: Profile, key: string): (boolean, string?)
+	local runner = self._migrations
+	if runner == nil then
+		return true, nil
+	end
+
+	if profile.RobloxMetaData == nil then
+		profile.RobloxMetaData = {}
+	end
+	if typeof(profile.RobloxMetaData) ~= "table" then
+		return false, "Profile.RobloxMetaData is not a table"
+	end
+
+	local metadata = profile.RobloxMetaData
+	local storedVersion = metadata[self._migrationMetadataKey]
+	local latestVersion = runner:GetLatestVersion()
+	if storedVersion == nil then
+		storedVersion = if profile.SessionLoadCount == 1 and not self._migrateNewProfiles then latestVersion else 0
+	end
+
+	if typeof(storedVersion) ~= "number" or storedVersion < 0 or storedVersion % 1 ~= 0 then
+		return false,
+			`invalid schema version {tostring(storedVersion)} in Roblox metadata "{self._migrationMetadataKey}"`
+	end
+
+	local ok, report = pcall(function()
+		return runner:Migrate(profile.Data, storedVersion, {
+			key = key,
+			userId = if player:IsA("Player") then player.UserId else nil,
+		})
+	end)
+	if not ok then
+		return false, tostring(report)
+	end
+
+	metadata[self._migrationMetadataKey] = latestVersion
+	if #report.applied > 0 then
+		self.Migrated:Fire(player, report)
+	end
+	return true, nil
+end
+
+function Server._prepareProfile(self: Server, player: Player, profile: Profile, key: string): (boolean, string?)
+	local migrationOk, migrationError = self:_migrateProfile(player, profile, key)
+	if not migrationOk then
+		return false, migrationError
+	end
+
+	profile:Reconcile()
+	return true, nil
+end
+
 function Server._onPlayerAdded(self: Server, player: Player)
 	if self._isDestroyed then
 		return
 	end
 
-	local key = self._keyPrefix .. tostring(player.UserId)
+	local key = self:GetKey(player)
 	local profile = self._store:StartSessionAsync(key, {
 		Cancel = function()
 			return player.Parent ~= Players
@@ -420,12 +583,24 @@ function Server._onPlayerAdded(self: Server, player: Player)
 	})
 
 	if not profile then
+		local reason = "ProfileStore could not start a profile session"
+		self.ProfileLoadFailed:Fire(player, reason)
 		player:Kick("Failed to load data, please rejoin")
 		return
 	end
 
 	profile:AddUserId(player.UserId)
-	profile:Reconcile()
+	local migrationOk, migrationError = self:_prepareProfile(player, profile, key)
+	if not migrationOk then
+		local reason = `Schema migration failed for "{key}": {migrationError}`
+		warn(`EZProfileStore: {reason}`)
+		self.ProfileLoadFailed:Fire(player, reason)
+		profile:EndSession()
+		if player.Parent == Players then
+			player:Kick("Failed to update your saved data safely. Please rejoin.")
+		end
+		return
+	end
 
 	if not player:IsDescendantOf(Players) then
 		profile:EndSession()
@@ -594,37 +769,92 @@ function Server._flushUpdates(self: Server)
 end
 
 --[=[
-	Returns the underlying ProfileStore profile for `player`, or `nil` if no
-	profile has loaded.
-
+	Returns the active profile.
 	@within Server
 	@method GetProfile
 	@param player Player
 	@return Profile?
 ]=]
 function Server.GetProfile(self: Server, player: Player): Profile?
-	return self._profiles[player]
+	local profile = self._profiles[player]
+	return if isProfileActive(profile) then profile else nil
 end
 
 --[=[
-	Returns the player's data table by reference, or `nil` if no profile has
-	loaded.
+	Yields for an active profile.
+	@within Server
+	@method GetProfileAsync
+	@yields
+	@param player Player
+	@param timeout number? -- Defaults to `10` seconds.
+	@return Profile?
+]=]
+function Server.GetProfileAsync(self: Server, player: Player, timeout: number?): Profile?
+	return self:_waitForProfile(player, timeout or 10)
+end
 
-	Direct mutations persist on the next ProfileStore save, but they do **not** replicate to the client and they do not fire [Server.DataUpdated]. Use the mutation methods for gameplay writes that clients need to observe.
-
+--[=[
+	Returns the active profile's data by reference.
 	@within Server
 	@method GetData
 	@param player Player
 	@return { [any]: any }?
 ]=]
 function Server.GetData(self: Server, player: Player): { [any]: any }?
-	local profile = self._profiles[player]
+	local profile = self:GetProfile(player)
 	return profile and profile.Data
 end
 
 --[=[
-	Reads the value at `keyPath`. Returns `nil` if the path does not resolve or the profile has not loaded. `keyPath` may be a dot string like `"Stats.Wins"` or an array like `{ "Stats", "Wins" }`.
+	Yields for active profile data.
+	@within Server
+	@method GetDataAsync
+	@yields
+	@param player Player
+	@param timeout number?
+	@return { [any]: any }?
+]=]
+function Server.GetDataAsync(self: Server, player: Player, timeout: number?): { [any]: any }?
+	if self:GetProfileAsync(player, timeout) == nil then
+		return nil
+	end
+	return self:GetData(player)
+end
 
+--[=[
+	Resolves a Player, UserId, or exact string key.
+	@within Server
+	@method GetKey
+	@param target Target
+	@return string
+]=]
+function Server.GetKey(self: Server, target: Target): string
+	if typeof(target) == "Instance" then
+		assert(target:IsA("Player"), "target Instance must be a Player")
+		return self._keyPrefix .. tostring((target :: Player).UserId)
+	elseif typeof(target) == "number" then
+		assert(target % 1 == 0, "numeric target must be an integer UserId")
+		return self._keyPrefix .. tostring(target)
+	elseif typeof(target) == "string" then
+		assert(#target > 0, "target key must not be empty")
+		return target
+	end
+
+	error("target must be a Player, UserId number, or exact key string", 2)
+end
+
+--[=[
+	Returns the underlying ProfileStore object.
+	@within Server
+	@method GetStore
+	@return any
+]=]
+function Server.GetStore(self: Server): any
+	return self._store
+end
+
+--[=[
+	Reads a profile path.
 	@within Server
 	@method ReadData
 	@param player Player
@@ -640,13 +870,7 @@ function Server.ReadData(self: Server, player: Player, keyPath: Shared.KeyPath):
 end
 
 --[=[
-	Sets a value at `keyPath`. Accepts dot-notation strings
-	(`"Currency.Coins"`) or array paths (`{ "Currency", "Coins" }`).
-
-	Replication and the [Server.DataUpdated] signal only fire when the value
-	actually changes. Replication is deferred to the end of the current frame,
-	so synchronous bursts of writes are coalesced into a single network event.
-
+	Sets or deletes a profile path.
 	@within Server
 	@method UpdateData
 	@param player Player
@@ -672,8 +896,7 @@ function Server.UpdateData(self: Server, player: Player, keyPath: Shared.KeyPath
 end
 
 --[=[
-	Appends `value` to the array at `keyPath`. The target must be a table; if it is missing or not a table, this warns and returns `false` without mutating or replicating.
-
+	Appends to an array path.
 	@within Server
 	@method InsertData
 	@param player Player
@@ -689,7 +912,7 @@ function Server.InsertData(self: Server, player: Player, keyPath: Shared.KeyPath
 
 	local path = Shared.resolveKeyPath(keyPath)
 	if not Shared.writePath(data, path, value, true) then
-		warn(`EZProfileStore: InsertData target at "{table.concat(path, ".")}" is not a table`)
+		warn(`EZProfileStore: InsertData target at "{Shared.toPathString(keyPath)}" is not a table`)
 		return false
 	end
 
@@ -699,11 +922,7 @@ function Server.InsertData(self: Server, player: Player, keyPath: Shared.KeyPath
 end
 
 --[=[
-	Adds `delta` (default `1`) to the numeric value at `keyPath`. A `nil`
-	current value is treated as `0`. Returns `false` if the profile is not
-	loaded, or the existing value is non-nil and non-numeric (in which case
-	the call warns and is a no-op).
-
+	Adds `delta` to a numeric path.
 	@within Server
 	@method IncrementData
 	@param player Player
@@ -720,7 +939,7 @@ function Server.IncrementData(self: Server, player: Player, keyPath: Shared.KeyP
 	local path = Shared.resolveKeyPath(keyPath)
 	local current = Shared.readPath(data, path)
 	if current ~= nil and typeof(current) ~= "number" then
-		warn(`EZProfileStore: IncrementData target at "{table.concat(path, ".")}" is not a number`)
+		warn(`EZProfileStore: IncrementData target at "{Shared.toPathString(keyPath)}" is not a number`)
 		return false
 	end
 
@@ -735,9 +954,7 @@ function Server.IncrementData(self: Server, player: Player, keyPath: Shared.KeyP
 end
 
 --[=[
-	Subtracts `delta` (default `1`) from the numeric value at `keyPath`.
-	Equivalent to `IncrementData(player, keyPath, -(delta or 1))`.
-
+	Subtracts `delta` from a numeric path.
 	@within Server
 	@method DecrementData
 	@param player Player
@@ -750,8 +967,7 @@ function Server.DecrementData(self: Server, player: Player, keyPath: Shared.KeyP
 end
 
 --[=[
-	Sets the value at `keyPath` to `nil`. Returns `false` when no profile is loaded or the path is already `nil`. Missing parent tables are not created.
-
+	Deletes a profile path.
 	@within Server
 	@method RemoveData
 	@param player Player
@@ -779,10 +995,7 @@ function Server.RemoveData(self: Server, player: Player, keyPath: Shared.KeyPath
 end
 
 --[=[
-	Replaces the array element at `index` (1-based) under `arrayPath`.
-	Returns `false` if the profile is not loaded, the target is not an array,
-	or `index` is out of bounds (`< 1` or `> #arr`).
-
+	Replaces an array item by index.
 	@within Server
 	@method UpdateArrayItem
 	@param player Player
@@ -814,10 +1027,7 @@ function Server.UpdateArrayItem(
 end
 
 --[=[
-	Removes the array element at `index` (1-based) under `arrayPath` via
-	`table.remove`. Returns `false` if the profile is not loaded, the target
-	is not an array, or `index` is out of bounds.
-
+	Removes an array item by index.
 	@within Server
 	@method RemoveArrayItem
 	@param player Player
@@ -842,12 +1052,7 @@ function Server.RemoveArrayItem(self: Server, player: Player, arrayPath: Shared.
 end
 
 --[=[
-	Applies multiple set/del writes to the player's profile in one frame.
-	Each entry's `value` follows the same semantics as `UpdateData`: `nil` deletes, anything else sets. Returns the number of paths that actually changed.
-
-	All wire entries from a single call will batch into the same network
-	event since they're queued before the next deferred flush.
-
+	Applies and batches multiple set/delete operations.
 	@within Server
 	@method BatchSetValues
 	@param player Player
@@ -874,9 +1079,7 @@ function Server.BatchSetValues(self: Server, player: Player, writes: { { path: S
 end
 
 --[=[
-	Forces an immediate save via `profile:Save()`. Returns `false` when no
-	profile is loaded for `player`. ProfileStore already auto-saves and saves when sessions end, so reserve this for critical checkpoints such as product receipts.
-
+	Forces an active profile save.
 	@within Server
 	@method SaveAsync
 	@yields
@@ -884,7 +1087,7 @@ end
 	@return boolean
 ]=]
 function Server.SaveAsync(self: Server, player: Player): boolean
-	local profile = self._profiles[player]
+	local profile = self:GetProfile(player)
 	if not profile then
 		return false
 	end
@@ -893,45 +1096,181 @@ function Server.SaveAsync(self: Server, player: Player): boolean
 end
 
 --[=[
-	Returns `true` when a profile is loaded for `player`.
-
+	Returns whether the profile is active.
 	@within Server
 	@method IsReady
 	@param player Player
 	@return boolean
 ]=]
 function Server.IsReady(self: Server, player: Player): boolean
-	return self._profiles[player] ~= nil
+	return self:GetProfile(player) ~= nil
+end
+
+local function rollbackResult(key: string, profile: any): RollbackResult
+	local keyInfo = profile.KeyInfo
+	assert(keyInfo ~= nil, "historical profile is missing KeyInfo")
+	assert(typeof(keyInfo.Version) == "string", "historical profile KeyInfo is missing Version")
+	assert(typeof(keyInfo.UpdatedTime) == "number", "historical profile KeyInfo is missing UpdatedTime")
+	assert(typeof(profile.Data) == "table", "historical profile Data must be a table")
+	return {
+		key = key,
+		version = keyInfo.Version,
+		updatedTime = keyInfo.UpdatedTime,
+		data = Shared.deepCopy(profile.Data),
+	}
+end
+
+function Server._selectRollback(self: Server, target: Target, selector: VersionSelector?): RollbackSelection?
+	local key = self:GetKey(target)
+	local resolved: VersionSelector = selector or ({} :: VersionSelector)
+	assert(
+		resolved.version == nil or (resolved.before == nil and resolved.stepsBack == nil),
+		"selector.version cannot be combined with before or stepsBack"
+	)
+
+	local profile: any = nil
+	if resolved.version ~= nil then
+		assert(typeof(resolved.version) == "string" and #resolved.version > 0, "selector.version must be non-empty")
+		profile = self._store:GetAsync(key, resolved.version)
+	else
+		local stepsBack = resolved.stepsBack
+		if stepsBack == nil then
+			stepsBack = if resolved.before == nil then 1 else 0
+		end
+		assert(
+			typeof(stepsBack) == "number" and stepsBack >= 0 and stepsBack % 1 == 0,
+			"selector.stepsBack must be a non-negative integer"
+		)
+
+		local query = self._store:VersionQuery(key, Enum.SortDirection.Descending, nil, resolved.before)
+		for _ = 0, stepsBack do
+			profile = query:NextAsync()
+			if profile == nil then
+				return nil
+			end
+		end
+	end
+
+	if profile then
+		return {
+			key = key,
+			profile = profile,
+		}
+	end
+	return nil
+end
+
+function Server._endActiveSessionForKeyAsync(self: Server, key: string): boolean
+	local activePlayer: Player? = nil
+	local activeProfile: Profile? = nil
+	for player, profile in self._profiles do
+		if profile.Key == key or self:GetKey(player) == key then
+			activePlayer = player
+			activeProfile = profile
+			break
+		end
+	end
+	if activePlayer == nil or activeProfile == nil then
+		return true
+	end
+
+	local released = Promise.fromEvent(self.ProfileReleased, function(player)
+		return player == activePlayer
+	end)
+	local saved = if activeProfile.OnAfterSave then Promise.fromEvent(activeProfile.OnAfterSave) else Promise.resolve()
+	activeProfile:EndSession()
+	local ok = Promise.all({ released, saved }):timeout(10):await()
+	if not ok and self._profiles[activePlayer] == activeProfile then
+		self:_releaseProfile(activePlayer, activeProfile, true)
+	end
+	return ok
+end
+
+function Server._applyRollbackAsync(self: Server, selection: RollbackSelection): RollbackResult
+	assert(self:_endActiveSessionForKeyAsync(selection.key), "active profile did not finish saving before rollback")
+	selection.profile:SetAsync()
+
+	local stored = self._store:GetAsync(selection.key)
+	local verified = stored ~= nil
+		and Shared.deepEqual(stored.Data, selection.profile.Data)
+		and Shared.deepEqual(stored.RobloxMetaData, selection.profile.RobloxMetaData)
+		and Shared.deepEqual(stored.UserIds, selection.profile.UserIds)
+	assert(verified, `rollback for "{selection.key}" could not be verified`)
+
+	local result = rollbackResult(selection.key, selection.profile)
+	self.RolledBack:Fire(result)
+	return result
 end
 
 --[=[
-	Removes the player's stored data via `ProfileStore:RemoveAsync`. Accepts either a `Player` (whose active session, if any, is ended first) or a raw `UserId` (offline wipe). Use carefully: this erases the ProfileStore key for the configured store and key prefix.
+	Loads a historical version without writing it.
+	@within Server
+	@method PreviewRollbackAsync
+	@yields
+	@param target Target
+	@param selector VersionSelector?
+	@return RollbackResult?
+]=]
+function Server.PreviewRollbackAsync(self: Server, target: Target, selector: VersionSelector?): RollbackResult?
+	local selection = self:_selectRollback(target, selector)
+	if selection == nil then
+		return nil
+	end
 
+	local result = rollbackResult(selection.key, selection.profile)
+	self._rollbackPreviews[result] = selection
+	return result
+end
+
+--[=[
+	Applies a preview once without reloading it.
+	@within Server
+	@method ApplyRollbackAsync
+	@yields
+	@param preview RollbackResult
+	@return RollbackResult
+]=]
+function Server.ApplyRollbackAsync(self: Server, preview: RollbackResult): RollbackResult
+	local selection = self._rollbackPreviews[preview]
+	assert(selection ~= nil, "preview is expired, already applied, or belongs to another Server")
+	local result = self:_applyRollbackAsync(selection)
+	self._rollbackPreviews[preview] = nil
+	return result
+end
+
+--[=[
+	Selects and restores a historical version.
+	@within Server
+	@method RollbackAsync
+	@yields
+	@param target Target
+	@param selector VersionSelector?
+	@return RollbackResult?
+]=]
+function Server.RollbackAsync(self: Server, target: Target, selector: VersionSelector?): RollbackResult?
+	local selection = self:_selectRollback(target, selector)
+	if selection == nil then
+		return nil
+	end
+	return self:_applyRollbackAsync(selection)
+end
+
+--[=[
+	Permanently removes a profile key.
 	@within Server
 	@method WipeAsync
 	@yields
-	@param target Player | number
+	@param target Target
 	@return boolean
 ]=]
-function Server.WipeAsync(self: Server, target: Player | number): boolean
-	local userId: number
-	if typeof(target) == "Instance" then
-		userId = target.UserId
-		local profile = self._profiles[target]
-		if profile then
-			profile:EndSession()
-		end
-	else
-		userId = target
-	end
-
-	local key = self._keyPrefix .. tostring(userId)
+function Server.WipeAsync(self: Server, target: Target): boolean
+	local key = self:GetKey(target)
+	assert(self:_endActiveSessionForKeyAsync(key), "active profile did not finish saving before wipe")
 	return self._store:RemoveAsync(key)
 end
 
 --[=[
-	Ends all active profile sessions, disconnects player listeners, and releases signals. Save-related ProfileStore signals remain connected while sessions are being ended. The replication remotes are not removed.
-
+	Releases sessions, connections, and signals.
 	@within Server
 	@method Destroy
 ]=]
@@ -940,6 +1279,7 @@ function Server.Destroy(self: Server)
 		return
 	end
 	self._isDestroyed = true
+	self._destroyedSignal:Fire()
 
 	for _, connection in self._connections do
 		connection:Disconnect()
@@ -952,6 +1292,7 @@ function Server.Destroy(self: Server)
 	end
 	table.clear(self._profileConnections)
 	table.clear(self._pendingBatches)
+	table.clear(self._rollbackPreviews)
 
 	self._requestData.OnServerInvoke = function()
 		return nil
@@ -964,6 +1305,10 @@ function Server.Destroy(self: Server)
 	self.PreSave:Destroy()
 	self.PostSave:Destroy()
 	self.LastSave:Destroy()
+	self._destroyedSignal:Destroy()
+	self.Migrated:Destroy()
+	self.ProfileLoadFailed:Destroy()
+	self.RolledBack:Destroy()
 end
 
 return Server

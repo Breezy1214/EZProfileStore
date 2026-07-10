@@ -2,10 +2,7 @@
 --[=[
 	@class EZProfileStore
 
-	Package entrypoint. `Server` and `Client` are loaded lazily so client-only code can require the package without loading server-only ProfileStore dependencies.
-
-	- [Server](/api/Server) - manages profile sessions and replicates updates to clients.
-	- [Client](/api/Client) - mirrors the player's profile and exposes path-based observers.
+	Lazy package entrypoint for `Server`, `Client`, and `Migrations`.
 ]=]
 
 local loaded: { [string]: any } = {}
@@ -30,7 +27,7 @@ end
 
 return setmetatable(EZProfileStore, {
 	__index = function(_, key: any)
-		if key == "Server" or key == "Client" then
+		if key == "Server" or key == "Client" or key == "Migrations" then
 			return loadModule(key :: string)
 		end
 		return nil

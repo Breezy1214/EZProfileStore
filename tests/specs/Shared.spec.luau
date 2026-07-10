@@ -4,6 +4,14 @@ local PackageRoot = ReplicatedStorage.Packages.EZProfileStore
 local Shared = require(PackageRoot.Shared)
 
 return function()
+	describe("Shared.deepEqual", function()
+		it("compares nested profile data", function()
+			expect(Shared.deepEqual({ Coins = 10, Items = { "a" } }, { Coins = 10, Items = { "a" } })).to.equal(true)
+			expect(Shared.deepEqual({ Coins = 10 }, { Coins = 11 })).to.equal(false)
+			expect(Shared.deepEqual({ Coins = 10 }, { Coins = 10, Gems = 1 })).to.equal(false)
+		end)
+	end)
+
 	describe("Shared.OP", function()
 		it("exposes the five opcodes", function()
 			expect(Shared.OP.Set).to.equal("set")

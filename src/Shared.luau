@@ -3,9 +3,7 @@
 	@class Shared
 	@private
 
-	Internal helpers shared between [Server] and [Client]: key-path
-	resolution, path read/write utilities, and the names used to wire up
-	the replication remotes.
+	Replication and immutable path helpers.
 ]=]
 
 local Shared = {}
@@ -24,12 +22,6 @@ Shared.OP = table.freeze({
 
 export type KeyPath = string | { string }
 
--- Wire-format tuple per replicated update (opcode-first):
---   { "set",  pathString, value }
---   { "del",  pathString }
---   { "ins",  pathString, value }
---   { "aupd", pathString, index, value }
---   { "arm",  pathString, index }
 export type Update = { any }
 export type Batch = { Update }
 
@@ -39,12 +31,39 @@ local PATH_CACHE_LIMIT = 256
 local _pathCache: { [string]: { string } } = {}
 local _pathCacheSize = 0
 
---[=[
-	Resolves a `KeyPath` to its array form. String paths are split on `.` and
-	cached. The returned array must be treated as read-only.
+function Shared.deepCopy(value: any): any
+	if typeof(value) ~= "table" then
+		return value
+	end
 
-	@private
-]=]
+	local result = {}
+	for key, child in value do
+		result[Shared.deepCopy(key)] = Shared.deepCopy(child)
+	end
+	return result
+end
+
+function Shared.deepEqual(left: any, right: any): boolean
+	if left == right then
+		return true
+	end
+	if typeof(left) ~= "table" or typeof(right) ~= "table" then
+		return false
+	end
+
+	for key, value in left do
+		if not Shared.deepEqual(value, right[key]) then
+			return false
+		end
+	end
+	for key in right do
+		if left[key] == nil then
+			return false
+		end
+	end
+	return true
+end
+
 function Shared.resolveKeyPath(keyPath: KeyPath): { string }
 	if typeof(keyPath) == "string" then
 		if keyPath == "" then
@@ -69,11 +88,6 @@ function Shared.resolveKeyPath(keyPath: KeyPath): { string }
 	return keyPath
 end
 
---[=[
-	Returns the canonical `.`-joined wire string for a `KeyPath`.
-
-	@private
-]=]
 function Shared.toPathString(keyPath: KeyPath): string
 	if typeof(keyPath) == "string" then
 		return keyPath
@@ -81,11 +95,6 @@ function Shared.toPathString(keyPath: KeyPath): string
 	return table.concat(keyPath, ".")
 end
 
---[=[
-	Reads the value at `path`. Returns `nil` if any segment fails to resolve.
-
-	@private
-]=]
 function Shared.readPath(data: any, path: { string }): any
 	local current: any = data
 	for _, key in path do
@@ -97,18 +106,7 @@ function Shared.readPath(data: any, path: { string }): any
 	return current
 end
 
---[=[
-	Mutates `root` in place, materializing missing intermediate tables.
-	Returns `true` only when a real change is made:
-	- set: `false` if the target already equals `value`.
-	- delete: `false` if the path is already missing.
-	- insert: `false` if the target is missing or not a table.
-	- empty path: always `false`.
-
-	Missing parents are created only for non-nil set operations. Deletes and inserts are no-ops when their parent path does not exist.
-
-	@private
-]=]
+-- Only non-nil set operations create missing parents.
 function Shared.writePath(root: any, path: { string }, value: any, isInsert: boolean): boolean
 	if #path == 0 then
 		return false
@@ -161,12 +159,6 @@ local function navigateToTable(root: any, path: { string }): any?
 	return target
 end
 
---[=[
-	Replaces `arr[index]` at the array under `path`. Returns `false` when the
-	target is missing/not a table, the index is out of bounds, or the path is empty.
-
-	@private
-]=]
 function Shared.arrayUpdate(root: any, path: { string }, index: number, value: any): boolean
 	if #path == 0 then
 		return false
@@ -182,13 +174,6 @@ function Shared.arrayUpdate(root: any, path: { string }, index: number, value: a
 	return true
 end
 
---[=[
-	Calls `table.remove(arr, index)` on the array under `path`. Returns `false`
-	when the target is missing/not a table, the index is out of bounds, or the
-	path is empty.
-
-	@private
-]=]
 function Shared.arrayRemove(root: any, path: { string }, index: number): boolean
 	if #path == 0 then
 		return false
@@ -204,15 +189,7 @@ function Shared.arrayRemove(root: any, path: { string }, index: number): boolean
 	return true
 end
 
---[=[
-	Returns a new root with the spine along `path` shallow-cloned and the
-	value written at the leaf. Sibling subtrees keep reference identity so
-	Fusion observers only re-evaluate along the changed spine.
-
-	Missing parents are created only for non-nil set operations. Invalid deletes and inserts return the original root reference.
-
-	@private
-]=]
+-- Clones only the changed spine so unaffected Fusion dependencies keep identity.
 function Shared.writePathSpine<T>(root: T, path: { string }, value: any, isInsert: boolean): T
 	if #path == 0 then
 		return root
@@ -275,13 +252,6 @@ function Shared.writePathSpine<T>(root: T, path: { string }, value: any, isInser
 	return newRoot :: T
 end
 
---[=[
-	Spine-clones the path down to the array, then replaces `arr[index]`.
-	Returns the original root (reference-equal) when the target is missing,
-	the index is out of bounds, or the path is empty.
-
-	@private
-]=]
 function Shared.arrayUpdateSpine<T>(root: T, path: { string }, index: number, value: any): T
 	if #path == 0 then
 		return root
@@ -314,13 +284,6 @@ function Shared.arrayUpdateSpine<T>(root: T, path: { string }, index: number, va
 	return newRoot :: T
 end
 
---[=[
-	Spine-clones the path down to the array, then `table.remove`s at `index`.
-	Returns the original root (reference-equal) when the target is missing,
-	the index is out of bounds, or the path is empty.
-
-	@private
-]=]
 function Shared.arrayRemoveSpine<T>(root: T, path: { string }, index: number): T
 	if #path == 0 then
 		return root
