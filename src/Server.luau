@@ -659,10 +659,18 @@ function Server._buildLeaderstats(self: Server, player: Player)
 	folder.Name = "leaderstats"
 
 	local mirror: { [string]: ValueBase } = {}
-	for _, entry in self._leaderstatsConfig do
+	local leaderstatCount = #self._leaderstatsConfig
+	
+	for index, entry in self._leaderstatsConfig do
 		local instance = Instance.new(entry.type)
 		instance.Name = entry.name
 		instance.Value = Shared.readPath(data, entry.path)
+
+		local priority = Instance.new("NumberValue")
+		priority.Name = "Priority"
+		priority.Value = leaderstatCount - index + 1
+		priority.Parent = instance
+
 		instance.Parent = folder
 		mirror[entry.pathStr] = instance
 	end

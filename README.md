@@ -115,7 +115,7 @@ local store = EZProfileStore.Server.new({
 })
 ```
 
-Tracked paths are validated against the template at startup. Updates are mirrored after the same deferred flush used for client replication.
+Tracked paths are validated against the template at startup. Stats appear in the same order as their entries in the `leaderstats` array. Updates are mirrored after the same deferred flush used for client replication.
 
 ## Schema Migrations
 
