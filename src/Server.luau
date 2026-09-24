@@ -185,6 +185,7 @@ export type Server = typeof(setmetatable(
 		_sequences: { [Player]: number },
 		_dirtyLeaderstats: { [Player]: true },
 		_profileWaits: { [Player]: any },
+		_snapshotRequests: { [Player]: true },
 		_flushScheduled: boolean,
 		_privatePaths: { { string } },
 		_validate: ((data: { [any]: any }) -> (boolean, string?))?,
@@ -469,6 +470,7 @@ function Server.new(config: Config): Server
 		_sequences = {},
 		_dirtyLeaderstats = {},
 		_profileWaits = {},
+		_snapshotRequests = {},
 		_flushScheduled = false,
 		_privatePaths = privatePaths,
 		_validate = config.validate,
@@ -490,7 +492,7 @@ function Server.new(config: Config): Server
 	}, Server) :: any
 
 	requestData.OnServerInvoke = function(player: Player): Shared.Snapshot?
-		return self:_waitForData(player)
+		return self:_serveSnapshotRequest(player)
 	end
 
 	table.insert(
@@ -581,6 +583,22 @@ end
 function Server._waitForData(self: Server, player: Player): Shared.Snapshot?
 	local profile = self:_waitForProfile(player, nil)
 	return if profile then self:_consumeSnapshot(player, profile) else nil
+end
+
+function Server._serveSnapshotRequest(self: Server, player: Player): Shared.Snapshot?
+	if self._snapshotRequests[player] then
+		return nil
+	end
+
+	self._snapshotRequests[player] = true
+	local ok, snapshot = pcall(self._waitForData, self, player)
+	self._snapshotRequests[player] = nil
+
+	if not ok then
+		error(snapshot, 0)
+	end
+
+	return snapshot
 end
 
 function Server._consumeSnapshot(self: Server, player: Player, profile: Profile): Shared.Snapshot
@@ -757,6 +775,7 @@ function Server._onPlayerRemoving(self: Server, player: Player)
 	self._leaderstats[player] = nil
 	self._pendingBatches[player] = nil
 	self._sequences[player] = nil
+	self._snapshotRequests[player] = nil
 
 	local profile = self._profiles[player]
 	if profile then
@@ -971,11 +990,11 @@ end
 	@method GetProfileAsync
 	@yields
 	@param player Player
-	@param timeout number? -- Defaults to `10` seconds.
+	@param timeout number? -- Waits until the profile loads, fails, or the player leaves by default.
 	@return Profile?
 ]=]
 function Server.GetProfileAsync(self: Server, player: Player, timeout: number?): Profile?
-	return self:_waitForProfile(player, timeout or 10)
+	return self:_waitForProfile(player, timeout)
 end
 
 --[=[
@@ -996,7 +1015,7 @@ end
 	@method GetDataAsync
 	@yields
 	@param player Player
-	@param timeout number?
+	@param timeout number? -- Waits until the profile loads, fails, or the player leaves by default.
 	@return { [any]: any }?
 ]=]
 function Server.GetDataAsync(self: Server, player: Player, timeout: number?): { [any]: any }?
@@ -1657,6 +1676,7 @@ function Server.Destroy(self: Server)
 	table.clear(self._profileConnections)
 	table.clear(self._pendingBatches)
 	table.clear(self._sequences)
+	table.clear(self._snapshotRequests)
 	table.clear(self._rollbackPreviews)
 	for _, entry in self._messageHandlers do
 		entry.active = false

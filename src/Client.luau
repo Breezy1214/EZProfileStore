@@ -351,7 +351,10 @@ end
 	@return Disconnect
 ]=]
 function Client.OnReady(self: Client, callback: (data: { [any]: any }) -> ()): Disconnect
-	local chain = self.Ready:andThen(callback)
+	local chain = Promise.new(function(resolve, reject)
+		self.Ready:andThen(resolve, reject)
+	end):andThen(callback)
+
 	return function()
 		chain:cancel()
 	end

@@ -142,6 +142,66 @@ return function()
 		end)
 	end)
 
+	describe("Server snapshot requests", function()
+		it("serves one in-flight request per player and rejects extras immediately", function()
+			local server = makeServer()
+			local player = makeFakePlayer()
+			local release = Signal.new()
+
+			local waits = 0
+			server._waitForData = function()
+				waits += 1
+				release:Wait()
+				return { seq = 0, data = {} }
+			end
+
+			local snapshot = nil
+			task.spawn(function()
+				snapshot = server:_serveSnapshotRequest(player)
+			end)
+
+			expect(server._snapshotRequests[player]).to.equal(true)
+			expect(server:_serveSnapshotRequest(player)).to.equal(nil)
+			expect(waits).to.equal(1)
+
+			release:Fire()
+			expect(snapshot.seq).to.equal(0)
+			expect(server._snapshotRequests[player]).to.equal(nil)
+
+			task.spawn(function()
+				server:_serveSnapshotRequest(player)
+			end)
+			expect(waits).to.equal(2)
+
+			server:_onPlayerRemoving(player)
+			expect(server._snapshotRequests[player]).to.equal(nil)
+
+			release:Fire()
+			server:Destroy()
+		end)
+
+		it("clears in-flight requests when the store is destroyed", function()
+			local server = makeServer()
+			local player = makeFakePlayer()
+			local release = Signal.new()
+
+			server._waitForData = function()
+				release:Wait()
+				return nil
+			end
+
+			task.spawn(function()
+				server:_serveSnapshotRequest(player)
+			end)
+			expect(server._snapshotRequests[player]).to.equal(true)
+
+			server:Destroy()
+			expect(server._snapshotRequests[player]).to.equal(nil)
+
+			release:Fire()
+		end)
+	end)
+
 	describe("Server:IncrementData", function()
 		it("adds delta to existing numeric path", function()
 			local server = makeServer()
