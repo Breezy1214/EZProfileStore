@@ -24,8 +24,13 @@ export type KeyPath = string | { string }
 
 export type Update = { any }
 export type Batch = { Update }
+export type Snapshot = {
+	seq: number,
+	data: { [any]: any },
+}
 
 local EMPTY_PATH: { string } = table.freeze({}) :: any
+local EMPTY_SEEN: { [any]: boolean } = table.freeze({}) :: any
 
 local PATH_CACHE_LIMIT = 256
 local _pathCache: { [string]: { string } } = {}
@@ -62,6 +67,159 @@ function Shared.deepEqual(left: any, right: any): boolean
 		end
 	end
 	return true
+end
+
+local SAVABLE_TYPES = table.freeze({
+	boolean = true,
+	number = true,
+	string = true,
+	table = true,
+	buffer = true,
+})
+
+local function describePath(path: { any }): string
+	return if #path == 0 then "" else ` at "{table.concat(path, ".")}"`
+end
+
+local function findUnsavable(value: any, path: { any }, seen: { [any]: boolean }): string?
+	local valueType = typeof(value)
+	if not SAVABLE_TYPES[valueType] then
+		return `{valueType} cannot be saved{describePath(path)}`
+	end
+
+	if valueType == "number" then
+		if value ~= value then
+			return `NaN cannot be saved{describePath(path)}`
+		elseif value == math.huge or value == -math.huge then
+			return `infinity cannot be saved{describePath(path)}`
+		end
+		return nil
+	elseif valueType == "string" then
+		if utf8.len(value) == nil then
+			return `malformed UTF-8 string cannot be saved{describePath(path)}`
+		end
+		return nil
+	elseif valueType ~= "table" then
+		return nil
+	end
+
+	if seen[value] then
+		return `cyclic table cannot be saved{describePath(path)}`
+	end
+	seen[value] = true
+
+	local arrayLength = #value
+	local hasStringKeys = false
+	local hasNumberKeys = false
+	for key, child in value do
+		if typeof(key) == "string" then
+			if utf8.len(key) == nil then
+				return `malformed UTF-8 key cannot be saved{describePath(path)}`
+			end
+			hasStringKeys = true
+		elseif typeof(key) == "number" then
+			if key % 1 ~= 0 or key < 1 or key > arrayLength then
+				return `sparse or non-integer array key {key} cannot be saved{describePath(path)}`
+			end
+			hasNumberKeys = true
+		else
+			return `{typeof(key)} key cannot be saved{describePath(path)}`
+		end
+
+		if hasStringKeys and hasNumberKeys then
+			return `mixed array/dictionary table cannot be saved{describePath(path)}`
+		end
+
+		table.insert(path, key)
+		local reason = findUnsavable(child, path, seen)
+		table.remove(path)
+		if reason then
+			return reason
+		end
+	end
+
+	seen[value] = nil
+	return nil
+end
+
+-- Rejects values DataStores cannot encode or remotes cannot replicate faithfully.
+function Shared.validateValue(value: any): (boolean, string?)
+	-- Scalars never touch `path` or `seen`, so skip allocating them on hot write paths.
+	local isTable = typeof(value) == "table"
+	local reason = findUnsavable(value, if isTable then {} else EMPTY_PATH, if isTable then {} else EMPTY_SEEN)
+	return reason == nil, reason
+end
+
+-- Key path segments must be non-empty strings without ".".
+function Shared.isValidKey(key: any): boolean
+	return typeof(key) == "string" and key ~= "" and string.find(key, ".", 1, true) == nil
+end
+
+function Shared.isPathAddressable(value: any): boolean
+	if typeof(value) ~= "table" then
+		return false
+	end
+	for key in value do
+		if not Shared.isValidKey(key) then
+			return false
+		end
+	end
+	return true
+end
+
+function Shared.isPrefix(prefix: { string }, path: { string }): boolean
+	if #prefix > #path then
+		return false
+	end
+	for i, key in prefix do
+		if path[i] ~= key then
+			return false
+		end
+	end
+	return true
+end
+
+-- Returns `value` with `paths` removed, cloning only the affected spine.
+function Shared.redact<T>(value: T, paths: { { string } }): T
+	local result = value
+	for _, path in paths do
+		result = Shared.writePathSpine(result, path, nil, false)
+	end
+	return result
+end
+
+export type Change = { path: { string }, value: any }
+
+local function diffInto(old: any, new: any, prefix: { string }, out: { Change })
+	for key, newChild in new do
+		local oldChild = old[key]
+		if oldChild == newChild then
+			continue
+		end
+
+		local path = table.clone(prefix)
+		table.insert(path, key)
+		if Shared.isPathAddressable(oldChild) and Shared.isPathAddressable(newChild) then
+			diffInto(oldChild, newChild, path, out)
+		elseif not Shared.deepEqual(oldChild, newChild) then
+			table.insert(out, { path = path, value = newChild })
+		end
+	end
+
+	for key in old do
+		if new[key] == nil then
+			local path = table.clone(prefix)
+			table.insert(path, key)
+			table.insert(out, { path = path, value = nil })
+		end
+	end
+end
+
+-- Minimal key-path changes that turn `old` into `new`; both roots must be path-addressable.
+function Shared.diff(old: { [any]: any }, new: { [any]: any }): { Change }
+	local out: { Change } = {}
+	diffInto(old, new, {}, out)
+	return out
 end
 
 function Shared.resolveKeyPath(keyPath: KeyPath): { string }
@@ -167,7 +325,7 @@ function Shared.arrayUpdate(root: any, path: { string }, index: number, value: a
 	if arr == nil then
 		return false
 	end
-	if index < 1 or index > #arr then
+	if index % 1 ~= 0 or index < 1 or index > #arr then
 		return false
 	end
 	arr[index] = value
@@ -182,7 +340,7 @@ function Shared.arrayRemove(root: any, path: { string }, index: number): boolean
 	if arr == nil then
 		return false
 	end
-	if index < 1 or index > #arr then
+	if index % 1 ~= 0 or index < 1 or index > #arr then
 		return false
 	end
 	table.remove(arr, index)

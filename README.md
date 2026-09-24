@@ -10,6 +10,10 @@ It owns the ProfileStore session lifecycle on the server, gives gameplay code a 
 - Path-based reads and writes using `"Stats.Wins"` or `{ "Stats", "Wins" }`.
 - Replicated mutations: set, delete, insert, increment, decrement, array item update/remove, and batch set/delete.
 - Per-frame replication batching so bursts of synchronous writes use one remote event.
+- Save-safety checks that reject NaN, infinity, Instances, malformed UTF-8, mixed or sparse tables, and cycles before they can break a save.
+- All-or-nothing `Mutate` and multi-player `MutateMany` updates with an optional `validate` hook.
+- `privatePaths` for server-only data that never reaches the client.
+- Offline messages (gifts, admin grants) through ProfileStore's `MessageAsync`.
 - Fusion-backed client mirror with `Ready`, `Read`, `WatchPath`, and `OnChanged`.
 - ProfileStore save signal forwards: `PreSave`, `PostSave`, and `LastSave`.
 - Optional `leaderstats` mirroring from profile paths.
@@ -24,7 +28,7 @@ Add the package to your [Wally](https://wally.run) manifest:
 
 ```toml
 [dependencies]
-EZProfileStore = "breezy1214/ezprofilestore@0.1.0"
+EZProfileStore = "breezy1214/ezprofilestore@0.1.3"
 ```
 
 ## Server Quick Start
@@ -61,6 +65,18 @@ local function givePotion(player)
 	store:IncrementData(player, "Stats.Wins")
 	store:UpdateData(player, "Coins", (store:ReadData(player, "Coins") or 0) + 25)
 end
+```
+
+For several related changes, use `Mutate`. It edits a copy and commits every change or none:
+
+```lua
+local bought = store:Mutate(player, function(data)
+	if data.Coins < 100 then
+		return false -- abort; nothing changes
+	end
+	data.Coins -= 100
+	table.insert(data.Inventory, "Sword")
+end)
 ```
 
 `GetData(player)` returns the live profile table. Direct mutations will save through ProfileStore, but they will not replicate to the client. Use the mutation methods for gameplay writes that UI code needs to observe.
@@ -116,6 +132,77 @@ local store = EZProfileStore.Server.new({
 ```
 
 Tracked paths are validated against the template at startup. Stats appear in the same order as their entries in the `leaderstats` array. Updates are mirrored after the same deferred flush used for client replication.
+
+## Save Safety
+
+A value that DataStores cannot encode makes every later save of that profile fail, so a single bad write can silently roll a player back. This is a known exploit when client input reaches profile data. Every mutation method checks values before writing. Rejected writes return `false` and warn with the reason:
+
+- `NaN` and `±math.huge`
+- Instances, functions, threads, and other Roblox types
+- Strings or keys that are not valid UTF-8 (for example `"\255"`)
+- Mixed array/dictionary tables, sparse arrays, non-integer or non-string keys
+- Cyclic tables
+
+Key path segments must be non-empty strings without `.`. Invalid paths raise an error because they indicate a programming mistake. You should still type-check and bound-check remote arguments before they reach the store.
+
+## Transactions and Validation
+
+`Mutate(player, transform)` gives `transform` a deep copy of the data. If the transform errors, returns `false`, yields, or produces unsavable values, the live data is untouched. Otherwise EZProfileStore diffs the copy against live data, writes only the changed paths, and replicates them in one batch.
+
+`MutateMany(players, transform)` does the same for several loaded players at once. Use it for trades, so a failed check cannot leave one side changed:
+
+```lua
+local traded = store:MutateMany({ seller, buyer }, function(drafts)
+	local index = table.find(drafts[seller].Inventory, itemId)
+	if not index or drafts[buyer].Coins < price then
+		return false
+	end
+	table.insert(drafts[buyer].Inventory, table.remove(drafts[seller].Inventory, index))
+	drafts[buyer].Coins -= price
+	drafts[seller].Coins += price
+end)
+```
+
+ProfileStore still saves each profile on its own, so `MutateMany` is atomic in memory, not across a server crash.
+
+Add `validate` to the config to enforce invariants. It runs when a profile loads (after migrations and `Reconcile`) and before every `Mutate` / `MutateMany` commit. A failed load fires `ProfileLoadFailed` and kicks the player. Single-path helpers such as `UpdateData` only run the save-safety checks, so use `Mutate` for writes that must satisfy `validate`.
+
+```lua
+validate = function(data)
+	if data.Coins < 0 then
+		return false, "Coins must not be negative"
+	end
+	return true
+end,
+```
+
+## Private Paths
+
+Keep server-only data such as receipts or moderation notes off the client:
+
+```lua
+privatePaths = { "PurchaseHistory", "Moderation.Notes" },
+```
+
+Private paths are removed from the initial snapshot. Writes inside them never replicate, and writes to a parent table replicate with the private children stripped. Leaderstats inside private paths still update on the server.
+
+## Offline Messages
+
+Send data to any profile, online or offline, and apply it when that profile loads:
+
+```lua
+store:OnMessage(function(player, message, processed)
+	if message.type == "Gift" and store:Mutate(player, function(data)
+		data.Coins += message.coins
+	end) then
+		processed() -- only mark processed once applied
+	end
+end)
+
+store:SendMessageAsync(recipientUserId, { type = "Gift", coins = 100 })
+```
+
+Messages that have not been processed are delivered again in the next session.
 
 ## Schema Migrations
 
@@ -217,6 +304,10 @@ ProfileStore does not provide version history through `ProfileStore.Mock`; test 
 - `UpdateArrayItem(player, arrayPath, index, value)` replaces a 1-based array item.
 - `RemoveArrayItem(player, arrayPath, index)` removes a 1-based array item with `table.remove`.
 - `BatchSetValues(player, writes)` applies multiple set/delete writes in one replication batch.
+- `Mutate(player, transform)` commits a transformed copy of the data, or nothing.
+- `MutateMany(players, transform)` commits transformed copies for several players, or nothing.
+- `SendMessageAsync(target, message)` queues a message for a profile via ProfileStore.
+- `OnMessage(handler)` handles messages for loaded profiles and returns a disconnect function.
 - `SaveAsync(player)` forces `profile:Save()` for critical checkpoints.
 - `PreviewRollbackAsync(target, selector?)` reads a historical version without writing.
 - `ApplyRollbackAsync(preview)` applies a preview once without a second version read.

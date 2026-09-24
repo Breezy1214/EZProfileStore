@@ -24,13 +24,17 @@ local function makeFakeProfile(data: { [any]: any })
 	}
 end
 
-local function makeServer(template: { [any]: any }?, leaderstats: { any }?)
-	return Server.new({
+local function makeServer(template: { [any]: any }?, leaderstats: { any }?, extra: { [string]: any }?)
+	local config: { [string]: any } = {
 		storeName = "TestStore_" .. tostring(math.random(1, 1e9)),
 		template = template or { Coins = 0 },
 		useMockInStudio = true,
 		leaderstats = leaderstats,
-	})
+	}
+	for key, value in extra or {} do
+		config[key] = value
+	end
+	return Server.new(config :: any)
 end
 
 local function seed(server: any, player: any, data: { [any]: any }): any
@@ -84,18 +88,55 @@ return function()
 			server:Destroy()
 		end)
 
-		it("_waitForData consumes pending updates already represented in the snapshot", function()
+		it("_waitForData seals the open batch under the snapshot sequence", function()
 			local server = makeServer({ Items = {} })
 			local player = makeFakePlayer()
 			seed(server, player, { Items = {} })
 
 			server:InsertData(player, "Items", "Sword")
 			expect(#server._pendingBatches[player]).to.equal(1)
+			expect(server._sequences[player]).to.equal(1)
 
 			local snapshot = server:_waitForData(player)
 
-			expect(snapshot.Items[1]).to.equal("Sword")
+			expect(snapshot.seq).to.equal(1)
+			expect(snapshot.data.Items[1]).to.equal("Sword")
 			expect(server._pendingBatches[player]).to.equal(nil)
+
+			server:InsertData(player, "Items", "Shield")
+			expect(server._sequences[player]).to.equal(2)
+
+			server:Destroy()
+		end)
+
+		it("starts a new sequence number only when a new batch opens", function()
+			local server = makeServer({ A = 0, B = 0 })
+			local player = makeFakePlayer()
+			seed(server, player, { A = 0, B = 0 })
+
+			server:UpdateData(player, "A", 1)
+			server:UpdateData(player, "B", 1)
+			expect(server._sequences[player]).to.equal(1)
+
+			server:_flushUpdates()
+			server:UpdateData(player, "A", 2)
+			expect(server._sequences[player]).to.equal(2)
+
+			server:Destroy()
+		end)
+
+		it("copies table payloads at queue time so later writes are not replayed twice", function()
+			local server = makeServer({})
+			local player = makeFakePlayer()
+			seed(server, player, {})
+
+			server:UpdateData(player, "Items", {})
+			server:InsertData(player, "Items", "Sword")
+
+			local batch = server._pendingBatches[player]
+			expect(#batch[1][3]).to.equal(0)
+			expect(batch[2][1]).to.equal(Shared.OP.Ins)
+			expect(#server:GetData(player).Items).to.equal(1)
 
 			server:Destroy()
 		end)
@@ -566,6 +607,311 @@ return function()
 			server:_mirrorLeaderstats(player)
 
 			expect(server._leaderstats[player]["Stats.Wins"].Value).to.equal(7)
+
+			server:Destroy()
+		end)
+	end)
+
+	describe("Server save-safety validation", function()
+		it("rejects values DataStores cannot save", function()
+			local server = makeServer({ Coins = 0 })
+			local player = makeFakePlayer()
+			seed(server, player, { Coins = 0, Name = "a" })
+
+			expect(server:UpdateData(player, "Coins", 0 / 0)).to.equal(false)
+			expect(server:UpdateData(player, "Coins", math.huge)).to.equal(false)
+			expect(server:UpdateData(player, "Name", "\255")).to.equal(false)
+			expect(server:UpdateData(player, "Color", workspace)).to.equal(false)
+			-- selene: allow(mixed_table)
+			expect(server:UpdateData(player, "Mixed", { 1, Key = 2 })).to.equal(false)
+			expect(server:InsertData(player, "Items", workspace)).to.equal(false)
+			expect(server:IncrementData(player, "Coins", 0 / 0)).to.equal(false)
+
+			local data = server:GetData(player)
+			expect(data.Coins).to.equal(0)
+			expect(data.Name).to.equal("a")
+			expect(data.Color).to.equal(nil)
+			expect(server._pendingBatches[player]).to.equal(nil)
+
+			server:Destroy()
+		end)
+
+		it("rejects fractional array indices", function()
+			local server = makeServer({ Items = {} })
+			local player = makeFakePlayer()
+			seed(server, player, { Items = { "a", "b" } })
+
+			expect(server:UpdateArrayItem(player, "Items", 1.5, "x")).to.equal(false)
+			expect(server:RemoveArrayItem(player, "Items", 1.5)).to.equal(false)
+			expect(#server:GetData(player).Items).to.equal(2)
+
+			server:Destroy()
+		end)
+
+		it("errors on key paths that cannot replicate", function()
+			local server = makeServer({})
+			local player = makeFakePlayer()
+			seed(server, player, {})
+
+			expect(function()
+				server:UpdateData(player, { "a.b" }, 1)
+			end).to.throw()
+			expect(function()
+				server:UpdateData(player, "a..b", 1)
+			end).to.throw()
+
+			server:Destroy()
+		end)
+	end)
+
+	describe("Server privatePaths", function()
+		it("keeps private paths out of snapshots and updates", function()
+			local server = makeServer({}, nil, { privatePaths = { "Receipts", "Admin.Notes" } })
+			local player = makeFakePlayer()
+			local data = { Coins = 0, Receipts = { a = true }, Admin = { Notes = "x", Rank = 1 } }
+			seed(server, player, data)
+
+			local snapshot = server:_waitForData(player)
+			expect(snapshot.data.Receipts).to.equal(nil)
+			expect(snapshot.data.Admin.Notes).to.equal(nil)
+			expect(snapshot.data.Admin.Rank).to.equal(1)
+			expect(data.Receipts.a).to.equal(true)
+			expect(data.Admin.Notes).to.equal("x")
+
+			expect(server:UpdateData(player, "Receipts.b", true)).to.equal(true)
+			expect(server._pendingBatches[player]).to.equal(nil)
+
+			server:UpdateData(player, "Admin", { Notes = "y", Rank = 2 })
+			local batch = server._pendingBatches[player]
+			expect(#batch).to.equal(1)
+			expect(batch[1][3].Rank).to.equal(2)
+			expect(batch[1][3].Notes).to.equal(nil)
+			expect(server:GetData(player).Admin.Notes).to.equal("y")
+
+			server:Destroy()
+		end)
+
+		it("still mirrors leaderstats inside private paths", function()
+			local server = makeServer({ Stats = { Wins = 0 } }, {
+				{ path = "Stats.Wins", name = "Wins", type = "IntValue" },
+			}, { privatePaths = { "Stats" } })
+			local player = makeFakePlayer()
+			seed(server, player, { Stats = { Wins = 0 } })
+			server:_buildLeaderstats(player)
+
+			server:IncrementData(player, "Stats.Wins")
+			expect(server._pendingBatches[player]).to.equal(nil)
+			server:_flushUpdates()
+
+			expect(server._leaderstats[player]["Stats.Wins"].Value).to.equal(1)
+
+			server:Destroy()
+		end)
+	end)
+
+	describe("Server:Mutate", function()
+		it("commits only the changed paths", function()
+			local server = makeServer({})
+			local player = makeFakePlayer()
+			seed(server, player, { Coins = 100, Items = {}, Stats = { Wins = 1, Losses = 0 }, Old = true })
+
+			local ok = server:Mutate(player, function(data)
+				data.Coins -= 40
+				table.insert(data.Items, "Sword")
+				data.Stats.Wins += 1
+				data.Old = nil
+			end)
+
+			expect(ok).to.equal(true)
+			local data = server:GetData(player)
+			expect(data.Coins).to.equal(60)
+			expect(data.Items[1]).to.equal("Sword")
+			expect(data.Stats.Wins).to.equal(2)
+			expect(data.Old).to.equal(nil)
+
+			local ops = {}
+			for _, entry in server._pendingBatches[player] do
+				ops[entry[2]] = entry[1]
+			end
+			expect(ops.Coins).to.equal(Shared.OP.Set)
+			expect(ops.Items).to.equal(Shared.OP.Set)
+			expect(ops["Stats.Wins"]).to.equal(Shared.OP.Set)
+			expect(ops["Stats.Losses"]).to.equal(nil)
+			expect(ops.Old).to.equal(Shared.OP.Del)
+
+			server:Destroy()
+		end)
+
+		it("discards the draft when the transform errors, aborts, yields, or saves bad data", function()
+			local server = makeServer({})
+			local player = makeFakePlayer()
+			seed(server, player, { Coins = 100 })
+
+			local function spend(data)
+				data.Coins = 0
+			end
+			expect(server:Mutate(player, function(data)
+				spend(data)
+				error("boom")
+			end)).to.equal(false)
+			expect(server:Mutate(player, function(data)
+				spend(data)
+				return false
+			end)).to.equal(false)
+			expect(server:Mutate(player, function(data)
+				spend(data)
+				task.wait()
+			end)).to.equal(false)
+			expect(server:Mutate(player, function(data)
+				data.Coins = 0 / 0
+			end)).to.equal(false)
+
+			expect(server:GetData(player).Coins).to.equal(100)
+			expect(server._pendingBatches[player]).to.equal(nil)
+
+			server:Destroy()
+		end)
+
+		it("runs config.validate before committing", function()
+			local server = makeServer({ Coins = 0 }, nil, {
+				validate = function(data)
+					return data.Coins >= 0, "Coins must not be negative"
+				end,
+			})
+			local player = makeFakePlayer()
+			seed(server, player, { Coins = 10 })
+
+			expect(server:Mutate(player, function(data)
+				data.Coins -= 20
+			end)).to.equal(false)
+			expect(server:Mutate(player, function(data)
+				data.Coins -= 5
+			end)).to.equal(true)
+			expect(server:GetData(player).Coins).to.equal(5)
+
+			server:Destroy()
+		end)
+
+		it("fails profile preparation when config.validate rejects loaded data", function()
+			local server = makeServer({ Coins = 0 }, nil, {
+				validate = function(data)
+					return data.Coins ~= nil, "missing Coins"
+				end,
+			})
+			local player = makeFakePlayer()
+			local profile = {
+				Data = {},
+				RobloxMetaData = {},
+				SessionLoadCount = 2,
+				Reconcile = function() end,
+			}
+
+			local ok, reason = server:_prepareProfile(player, profile, "Player_1")
+			expect(ok).to.equal(false)
+			expect(reason).to.equal("missing Coins")
+
+			server:Destroy()
+		end)
+	end)
+
+	describe("Server:MutateMany", function()
+		it("trades between players atomically", function()
+			local server = makeServer({})
+			local alice = makeFakePlayer()
+			local bob = makeFakePlayer()
+			seed(server, alice, { Items = { "Sword" }, Coins = 0 })
+			seed(server, bob, { Items = {}, Coins = 50 })
+
+			local ok = server:MutateMany({ alice, bob }, function(drafts)
+				table.insert(drafts[bob].Items, table.remove(drafts[alice].Items, 1))
+				drafts[bob].Coins -= 50
+				drafts[alice].Coins += 50
+			end)
+
+			expect(ok).to.equal(true)
+			expect(#server:GetData(alice).Items).to.equal(0)
+			expect(server:GetData(bob).Items[1]).to.equal("Sword")
+			expect(server:GetData(alice).Coins).to.equal(50)
+			expect(server:GetData(bob).Coins).to.equal(0)
+
+			server:Destroy()
+		end)
+
+		it("changes nobody when one side fails", function()
+			local server = makeServer({ Coins = 0 }, nil, {
+				validate = function(data)
+					return data.Coins >= 0
+				end,
+			})
+			local alice = makeFakePlayer()
+			local bob = makeFakePlayer()
+			local offline = makeFakePlayer()
+			seed(server, alice, { Coins = 0 })
+			seed(server, bob, { Coins = 10 })
+
+			expect(server:MutateMany({ alice, bob }, function(drafts)
+				drafts[alice].Coins += 50
+				drafts[bob].Coins -= 50
+			end)).to.equal(false)
+			expect(server:MutateMany({ alice, offline }, function(drafts)
+				drafts[alice].Coins += 50
+			end)).to.equal(false)
+
+			expect(server:GetData(alice).Coins).to.equal(0)
+			expect(server:GetData(bob).Coins).to.equal(10)
+
+			server:Destroy()
+		end)
+	end)
+
+	describe("Server messages", function()
+		it("sends savable messages through the store", function()
+			local sent = {}
+			local store = {
+				MessageAsync = function(_, key, message)
+					table.insert(sent, { key = key, message = message })
+					return true
+				end,
+			}
+			local server = Server.new({ storeName = "Messages", template = {}, store = store })
+
+			expect(server:SendMessageAsync(42, { Gift = 10 })).to.equal(true)
+			expect(server:SendMessageAsync(42, { Gift = 0 / 0 })).to.equal(false)
+			expect(#sent).to.equal(1)
+			expect(sent[1].key).to.equal("Player_42")
+
+			server:Destroy()
+		end)
+
+		it("delivers messages to handlers until disconnected", function()
+			local server = makeServer({})
+			local player = makeFakePlayer()
+			local profile = seed(server, player, { Coins = 0 })
+			local profileHandlers = {}
+			profile.MessageHandler = function(_, fn)
+				table.insert(profileHandlers, fn)
+			end
+
+			local received = {}
+			local disconnect = server:OnMessage(function(fromPlayer, message, processed)
+				table.insert(received, message)
+				expect(fromPlayer).to.equal(player)
+				processed()
+			end)
+			expect(#profileHandlers).to.equal(1)
+
+			local processedCount = 0
+			profileHandlers[1]({ Gift = 5 }, function()
+				processedCount += 1
+			end)
+			disconnect()
+			profileHandlers[1]({ Gift = 6 }, function()
+				processedCount += 1
+			end)
+
+			expect(#received).to.equal(1)
+			expect(received[1].Gift).to.equal(5)
+			expect(processedCount).to.equal(1)
 
 			server:Destroy()
 		end)

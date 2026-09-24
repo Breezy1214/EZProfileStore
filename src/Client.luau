@@ -43,12 +43,17 @@ export type Config = {
 }
 
 export type Disconnect = () -> ()
+type PendingBatch = {
+	seq: number,
+	batch: Shared.Batch,
+}
 export type PathWatcher = PathWatcher.PathWatcher
 
 export type Client = typeof(setmetatable(
 	{} :: {
 		_dataValue: Fusion.Value<{ [any]: any }?>,
-		_pendingBatches: { Shared.Batch },
+		_seq: number,
+		_pendingBatches: { PendingBatch },
 		_pendingEntryCount: number,
 		_overflowWarned: boolean,
 		_connections: { RBXScriptConnection },
@@ -104,6 +109,7 @@ function Client.new(config: Config?): Client
 
 	local self = setmetatable({
 		_dataValue = scope:Value(nil),
+		_seq = 0,
 		_pendingBatches = {},
 		_pendingEntryCount = 0,
 		_overflowWarned = false,
@@ -118,8 +124,8 @@ function Client.new(config: Config?): Client
 
 	table.insert(
 		self._connections,
-		dataUpdate.OnClientEvent:Connect(function(batch)
-			self:_handleUpdate(batch)
+		dataUpdate.OnClientEvent:Connect(function(seq, batch)
+			self:_handleUpdate(seq, batch)
 		end)
 	)
 
@@ -143,8 +149,8 @@ function Client.new(config: Config?): Client
 			return
 		end
 
-		if snapshot == nil then
-			self:_rejectInit("EZProfileStore.Client: snapshot request returned nil")
+		if typeof(snapshot) ~= "table" or typeof(snapshot.seq) ~= "number" or typeof(snapshot.data) ~= "table" then
+			self:_rejectInit("EZProfileStore.Client: snapshot request returned no data")
 			return
 		end
 
@@ -166,28 +172,30 @@ function Client._rejectInit(self: Client, reason: any)
 	self._rejectReady(reason)
 end
 
-function Client._handleInit(self: Client, data: { [any]: any })
+function Client._handleInit(self: Client, snapshot: Shared.Snapshot)
 	if self._isDestroyed or self:_isInitialized() then
 		return
 	end
 
-	self._dataValue:set(data)
+	self._dataValue:set(snapshot.data)
+	self._seq = snapshot.seq
 
-	if #self._pendingBatches > 0 then
-		local pending = self._pendingBatches
-		self._pendingBatches = {}
-		self._pendingEntryCount = 0
-
-		for _, batch in pending do
-			self:_applyBatch(batch, false)
+	local pending = self._pendingBatches
+	self._pendingBatches = {}
+	self._pendingEntryCount = 0
+	for _, entry in pending do
+		-- Batches at or below the snapshot sequence are already contained in it.
+		if entry.seq > self._seq then
+			self._seq = entry.seq
+			self:_applyBatch(entry.batch, false)
 		end
 	end
 
 	self._resolveReady(Fusion.peek(self._dataValue))
 end
 
-function Client._handleUpdate(self: Client, batch: Shared.Batch)
-	if self._isDestroyed or typeof(batch) ~= "table" then
+function Client._handleUpdate(self: Client, seq: number, batch: Shared.Batch)
+	if self._isDestroyed or typeof(seq) ~= "number" or typeof(batch) ~= "table" then
 		return
 	end
 
@@ -202,11 +210,15 @@ function Client._handleUpdate(self: Client, batch: Shared.Batch)
 			end
 			return
 		end
-		table.insert(self._pendingBatches, batch)
+		table.insert(self._pendingBatches, { seq = seq, batch = batch })
 		self._pendingEntryCount += incoming
 		return
 	end
 
+	if seq <= self._seq then
+		return
+	end
+	self._seq = seq
 	self:_applyBatch(batch, true)
 end
 

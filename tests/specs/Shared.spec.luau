@@ -12,6 +12,91 @@ return function()
 		end)
 	end)
 
+	describe("Shared.validateValue", function()
+		it("accepts savable nested data", function()
+			expect(Shared.validateValue({ Coins = 1, Items = { "a", "b" }, Flags = { On = true }, Empty = {} })).to.equal(
+				true
+			)
+			expect(Shared.validateValue(buffer.create(4))).to.equal(true)
+		end)
+
+		it("rejects values DataStores cannot encode", function()
+			local cyclic = {}
+			cyclic.Self = cyclic
+
+			for _, value in { 0 / 0, math.huge, -math.huge, "\255", "\237\190\140", workspace, print, Vector3.zero } do
+				expect(Shared.validateValue(value)).to.equal(false)
+			end
+			expect(Shared.validateValue({ Nested = { Bad = 0 / 0 } })).to.equal(false)
+			expect(Shared.validateValue({ ["\255"] = 1 })).to.equal(false)
+			-- selene: allow(mixed_table)
+			expect(Shared.validateValue({ 1, Key = 2 })).to.equal(false)
+			expect(Shared.validateValue({ [1] = 1, [3] = 3 })).to.equal(false)
+			expect(Shared.validateValue({ [1.5] = 1 })).to.equal(false)
+			expect(Shared.validateValue({ [workspace] = 1 })).to.equal(false)
+			expect(Shared.validateValue(cyclic)).to.equal(false)
+		end)
+
+		it("names the offending path", function()
+			local _, reason = Shared.validateValue({ Stats = { Wins = 0 / 0 } })
+			expect(string.find(reason, "Stats.Wins", 1, true)).to.be.ok()
+		end)
+	end)
+
+	describe("Shared.redact", function()
+		it("removes paths without mutating the source", function()
+			local source = { A = { Secret = 1, Public = 2 }, B = 3 }
+			local result = Shared.redact(source, { { "A", "Secret" }, { "Missing", "Path" } })
+
+			expect(result.A.Secret).to.equal(nil)
+			expect(result.A.Public).to.equal(2)
+			expect(result.B).to.equal(3)
+			expect(source.A.Secret).to.equal(1)
+		end)
+
+		it("returns the same table when nothing is removed", function()
+			local source = { A = 1 }
+			expect(Shared.redact(source, { { "B" } })).to.equal(source)
+		end)
+	end)
+
+	describe("Shared.diff", function()
+		local function byPath(changes)
+			local result = {}
+			for _, change in changes do
+				result[table.concat(change.path, ".")] = change
+			end
+			return result
+		end
+
+		it("recurses into dictionaries and replaces arrays whole", function()
+			local changes = byPath(Shared.diff({
+				Coins = 1,
+				Stats = { Wins = 1, Losses = 0 },
+				Items = { "a" },
+				Gone = true,
+			}, {
+				Coins = 2,
+				Stats = { Wins = 2, Losses = 0 },
+				Items = { "a", "b" },
+				New = { X = 1 },
+			}))
+
+			expect(changes.Coins.value).to.equal(2)
+			expect(changes["Stats.Wins"].value).to.equal(2)
+			expect(changes["Stats.Losses"]).to.equal(nil)
+			expect(#changes.Items.value).to.equal(2)
+			expect(changes.New.value.X).to.equal(1)
+			expect(changes.Gone).to.be.ok()
+			expect(changes.Gone.value).to.equal(nil)
+		end)
+
+		it("replaces dictionaries whose keys cannot be addressed by paths", function()
+			local changes = byPath(Shared.diff({ Ids = { ["a.b"] = 1 } }, { Ids = { ["a.b"] = 2 } }))
+			expect(changes.Ids.value["a.b"]).to.equal(2)
+		end)
+	end)
+
 	describe("Shared.OP", function()
 		it("exposes the five opcodes", function()
 			expect(Shared.OP.Set).to.equal("set")
