@@ -110,7 +110,6 @@ local Signal = require(script.Parent.Parent.Signal)
 
 local DEFAULT_KEY_PREFIX = "Player_"
 local DEFAULT_MIGRATION_METADATA_KEY = "EZProfileStoreVersion"
-local SNAPSHOT_WAIT_TIMEOUT = 30
 
 export type StoreMode = "live" | "studio" | "mock"
 export type Target = Player | number | string
@@ -531,7 +530,7 @@ function Server.mock(config: Config): Server
 	return Server.new(resolved)
 end
 
-function Server._waitForProfile(self: Server, player: Player, timeout: number): Profile?
+function Server._waitForProfile(self: Server, player: Player, timeout: number?): Profile?
 	local profile = self._profiles[player]
 	if isProfileActive(profile) then
 		return profile
@@ -565,7 +564,12 @@ function Server._waitForProfile(self: Server, player: Player, timeout: number): 
 	end
 
 	-- Chain before timing out so one caller's timeout cannot cancel the shared wait.
-	local ok, outcome = pending:andThen():timeout(timeout):await()
+	local waiter = pending:andThen()
+	if timeout ~= nil then
+		waiter = waiter:timeout(timeout)
+	end
+
+	local ok, outcome = waiter:await()
 	if not ok or outcome ~= "loaded" then
 		return nil
 	end
@@ -575,7 +579,7 @@ function Server._waitForProfile(self: Server, player: Player, timeout: number): 
 end
 
 function Server._waitForData(self: Server, player: Player): Shared.Snapshot?
-	local profile = self:_waitForProfile(player, SNAPSHOT_WAIT_TIMEOUT)
+	local profile = self:_waitForProfile(player, nil)
 	return if profile then self:_consumeSnapshot(player, profile) else nil
 end
 
@@ -819,6 +823,14 @@ function Server._mirrorLeaderstats(self: Server, player: Player)
 	end
 end
 
+function Server._applySet(self: Server, player: Player, data: { [any]: any }, path: { string }, value: any): boolean
+	if not Shared.writePath(data, path, value, false) then
+		return false
+	end
+	self:_queueUpdate(player, if value == nil then Shared.OP.Del else Shared.OP.Set, path, value)
+	return true
+end
+
 -- Sets or deletes one path, then replicates and signals the change.
 function Server._commitSet(
 	self: Server,
@@ -828,10 +840,9 @@ function Server._commitSet(
 	keyPath: Shared.KeyPath,
 	value: any
 ): boolean
-	if not Shared.writePath(data, path, value, false) then
+	if not self:_applySet(player, data, path, value) then
 		return false
 	end
-	self:_queueUpdate(player, if value == nil then Shared.OP.Del else Shared.OP.Set, path, value)
 	self.DataUpdated:Fire(player, keyPath, value)
 	return true
 end
@@ -1276,10 +1287,10 @@ end
 	@within Server
 	@method Mutate
 	@param player Player
-	@param transform (data: { [any]: any }) -> boolean?
+	@param transform (data: { [any]: any }) -> ...boolean
 	@return boolean -- `true` if the draft was committed.
 ]=]
-function Server.Mutate(self: Server, player: Player, transform: (data: { [any]: any }) -> boolean?): boolean
+function Server.Mutate(self: Server, player: Player, transform: (data: { [any]: any }) -> ...boolean): boolean
 	assert(typeof(transform) == "function", "Mutate expects a transform function")
 	return self:MutateMany({ player }, function(drafts)
 		return transform(drafts[player])
@@ -1294,13 +1305,13 @@ end
 	@within Server
 	@method MutateMany
 	@param players { Player }
-	@param transform (drafts: { [Player]: { [any]: any } }) -> boolean?
+	@param transform (drafts: { [Player]: { [any]: any } }) -> ...boolean
 	@return boolean -- `true` if every draft was committed.
 ]=]
 function Server.MutateMany(
 	self: Server,
 	players: { Player },
-	transform: (drafts: { [Player]: { [any]: any } }) -> boolean?
+	transform: (drafts: { [Player]: { [any]: any } }) -> ...boolean
 ): boolean
 	assert(typeof(players) == "table" and #players > 0, "MutateMany expects a non-empty player list")
 	assert(typeof(transform) == "function", "MutateMany expects a transform function")
@@ -1361,11 +1372,18 @@ function Server.MutateMany(
 		changesByPlayer[player] = changes
 	end
 
+	local committed: { { player: Player, change: Shared.Change } } = {}
 	for _, player in players do
 		local data = originals[player]
 		for _, change in changesByPlayer[player] do
-			self:_commitSet(player, data, change.path, change.path, change.value)
+			if self:_applySet(player, data, change.path, change.value) then
+				table.insert(committed, { player = player, change = change })
+			end
 		end
+	end
+
+	for _, entry in committed do
+		self.DataUpdated:Fire(entry.player, entry.change.path, entry.change.value)
 	end
 	return true
 end

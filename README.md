@@ -28,7 +28,7 @@ Add the package to your [Wally](https://wally.run) manifest:
 
 ```toml
 [dependencies]
-EZProfileStore = "breezy1214/ezprofilestore@0.1.3"
+EZProfileStore = "breezy1214/ezprofilestore@0.1.4"
 ```
 
 ## Server Quick Start

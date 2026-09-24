@@ -812,6 +812,41 @@ return function()
 
 			server:Destroy()
 		end)
+
+		it("fires DataUpdated after the whole commit so listener writes are kept", function()
+			local server = makeServer({})
+			local player = makeFakePlayer()
+			seed(server, player, { Crates = { Opened = 0 }, Currency = { Gems = 100 } })
+
+			local firstSeen = nil
+			server.DataUpdated:Connect(function(_, keyPath)
+				local data = server:GetData(player)
+				if firstSeen == nil then
+					firstSeen = { opened = data.Crates.Opened, gems = data.Currency.Gems }
+				end
+				if Shared.toPathString(keyPath) == "Crates.Opened" then
+					server:IncrementData(player, "Currency.Gems", 10)
+				end
+			end)
+
+			expect(server:Mutate(player, function(data)
+				data.Crates.Opened += 1
+				data.Currency.Gems -= 50
+			end)).to.equal(true)
+
+			expect(firstSeen.opened).to.equal(1)
+			expect(firstSeen.gems).to.equal(50)
+			expect(server:GetData(player).Currency.Gems).to.equal(60)
+
+			local replicated = {}
+			for _, entry in server._pendingBatches[player] do
+				replicated[entry[2]] = entry[3]
+			end
+			expect(replicated["Crates.Opened"]).to.equal(1)
+			expect(replicated["Currency.Gems"]).to.equal(60)
+
+			server:Destroy()
+		end)
 	end)
 
 	describe("Server:MutateMany", function()

@@ -299,15 +299,23 @@ function Client.GetDataState(self: Client)
 end
 
 --[=[
-	Yields for the initial snapshot or errors on timeout.
+	Yields for the initial snapshot. Errors if it fails to load or `timeout` elapses.
 	@within Client
 	@method GetDataAsync
 	@yields
-	@param timeout number? -- Defaults to `10`.
+	@param timeout number? -- Waits until `Ready` settles by default.
 	@return { [any]: any }
 ]=]
 function Client.GetDataAsync(self: Client, timeout: number?): { [any]: any }
-	return self.Ready:timeout(timeout or 10):expect()
+	if timeout == nil then
+		return self.Ready:expect()
+	end
+
+	return Promise.new(function(resolve, reject)
+		self.Ready:andThen(resolve, reject)
+	end)
+		:timeout(timeout)
+		:expect()
 end
 
 --[=[
