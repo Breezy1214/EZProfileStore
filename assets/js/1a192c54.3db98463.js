@@ -1,0 +1,1 @@
+"use strict";(self.webpackChunkdocs=self.webpackChunkdocs||[]).push([[573],{6993:e=>{e.exports=JSON.parse('{"functions":[],"properties":[],"types":[],"name":"Shared","desc":"Replication and immutable path helpers.","private":true,"source":{"line":8,"path":"src/Shared.luau"}}')}}]);

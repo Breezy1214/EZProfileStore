@@ -1,0 +1,1 @@
+"use strict";(self.webpackChunkdocs=self.webpackChunkdocs||[]).push([[544],{7997:e=>{e.exports=JSON.parse('{"functions":[],"properties":[],"types":[],"name":"EZProfileStore","desc":"Lazy package entrypoint for `Server`, `Client`, and `Migrations`.","source":{"line":7,"path":"src/init.luau"}}')}}]);
