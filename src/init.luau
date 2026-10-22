@@ -5,15 +5,9 @@
 	Package entrypoint; `Server`, `Client`, and `Migrations` load lazily.
 ]=]
 
-local Path = require(script.Path)
 local Types = require(script.Types)
 
-export type Path<Data, V> = Path.Path<Data, V>
-export type AnyPath<Data> = Path.AnyPath<Data>
-export type PathTree<Data> = Path.PathTree<Data>
-export type ReadOnly<T> = Path.ReadOnly<T>
-export type Write<Data> = Path.Write<Data>
-
+export type ReadOnly<T> = Types.ReadOnly<T>
 export type Server<Data> = Types.Server<Data>
 export type ServerConfig<Data> = Types.ServerConfig<Data>
 export type Profile<Data> = Types.Profile<Data>
@@ -25,11 +19,10 @@ export type RollbackResult = Types.RollbackResult
 export type MessageHandler = Types.MessageHandler
 export type Client<Data> = Types.Client<Data>
 export type ClientConfig<Data> = Types.ClientConfig<Data>
+export type Selection<V> = Types.Selection<V>
 export type Ready<T> = Types.Ready<T>
-export type Watcher<V> = Types.Watcher<V>
 
 type Package = {
-	Path: typeof(Path),
 	Server: typeof(require(script.Server)),
 	Client: typeof(require(script.Client)),
 	Migrations: typeof(require(script.Migrations)),
@@ -44,9 +37,7 @@ table.freeze(LAZY_MODULES)
 
 local requireModule: (module: ModuleScript) -> unknown = require
 
-local EZProfileStore: { [string]: unknown } = {
-	Path = Path,
-}
+local EZProfileStore: { [string]: unknown } = {}
 
 local function loadModule(name: string): unknown
 	local child = script:FindFirstChild(name)

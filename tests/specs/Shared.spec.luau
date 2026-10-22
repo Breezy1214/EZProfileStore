@@ -56,155 +56,67 @@ return function()
 	end)
 
 	describe("Shared.diff", function()
-		local function byPath(changes)
+		local function diff(old, new)
+			local out = {}
+			Shared.diff(old, new, {}, out)
 			local result = {}
-			for _, change in changes do
-				result[table.concat(change.path, ".")] = change
+			for _, change in out do
+				result[change.key] = change
 			end
-			return result
+			return result, out
 		end
 
-		it("recurses into dictionaries and replaces arrays whole", function()
-			local changes = byPath(Shared.diff({
+		it("recurses into dictionaries", function()
+			local changes = diff({
 				Coins = 1,
 				Stats = { Wins = 1, Losses = 0 },
-				Items = { "a" },
 				Gone = true,
 			}, {
 				Coins = 2,
 				Stats = { Wins = 2, Losses = 0 },
-				Items = { "a", "b" },
 				New = { X = 1 },
-			}))
+			})
 
-			expect(changes.Coins.value).to.equal(2)
+			expect(changes.Coins.op).to.equal(Shared.OP.Set)
 			expect(changes["Stats.Wins"].value).to.equal(2)
 			expect(changes["Stats.Losses"]).to.equal(nil)
-			expect(#changes.Items.value).to.equal(2)
 			expect(changes.New.value.X).to.equal(1)
-			expect(changes.Gone).to.be.ok()
-			expect(changes.Gone.value).to.equal(nil)
+			expect(changes.Gone.op).to.equal(Shared.OP.Del)
+		end)
+
+		it("emits ins for appends and set for any other array change", function()
+			local _, appended = diff({ Items = { "a" } }, { Items = { "a", "b", "c" } })
+			expect(#appended).to.equal(2)
+			expect(appended[1].op).to.equal(Shared.OP.Ins)
+			expect(appended[1].value).to.equal("b")
+			expect(appended[2].value).to.equal("c")
+
+			local replaced = diff({ Items = { "a", "b" } }, { Items = { "b" } })
+			expect(replaced.Items.op).to.equal(Shared.OP.Set)
+			expect(#replaced.Items.value).to.equal(1)
 		end)
 
 		it("replaces dictionaries whose keys cannot be addressed by paths", function()
-			local changes = byPath(Shared.diff({ Ids = { ["a.b"] = 1 } }, { Ids = { ["a.b"] = 2 } }))
+			local changes = diff({ Ids = { ["a.b"] = 1 } }, { Ids = { ["a.b"] = 2 } })
 			expect(changes.Ids.value["a.b"]).to.equal(2)
 		end)
 	end)
 
-	describe("Shared.arrayUpdate", function()
-		it("replaces the value at a 1-based index", function()
-			local root = { Items = { "a", "b", "c" } }
-			local changed = Shared.arrayUpdate(root, { "Items" }, 2, "B")
-			expect(changed).to.equal(true)
-			expect(root.Items[2]).to.equal("B")
+	describe("Shared.trace", function()
+		it("records the path a selector reads", function()
+			local path = Shared.trace(function(data: any)
+				return data.Stats.Wins
+			end)
+			expect(table.concat(path, ".")).to.equal("Stats.Wins")
 		end)
 
-		it("returns false on out-of-bounds index", function()
-			local root = { Items = { "a" } }
-			expect(Shared.arrayUpdate(root, { "Items" }, 0, "x")).to.equal(false)
-			expect(Shared.arrayUpdate(root, { "Items" }, 5, "x")).to.equal(false)
-			expect(root.Items[1]).to.equal("a")
-		end)
-
-		it("returns false when target is not an array", function()
-			local root = { Stats = { Coins = 5 } }
-			expect(Shared.arrayUpdate(root, { "Stats" }, 1, "x")).to.equal(false)
-		end)
-	end)
-
-	describe("Shared.arrayRemove", function()
-		it("removes the value at a 1-based index and shrinks length", function()
-			local root = { Items = { "a", "b", "c" } }
-			local changed = Shared.arrayRemove(root, { "Items" }, 2)
-			expect(changed).to.equal(true)
-			expect(root.Items[1]).to.equal("a")
-			expect(root.Items[2]).to.equal("c")
-			expect(#root.Items).to.equal(2)
-		end)
-
-		it("returns false on out-of-bounds index", function()
-			local root = { Items = { "a" } }
-			expect(Shared.arrayRemove(root, { "Items" }, 0)).to.equal(false)
-			expect(Shared.arrayRemove(root, { "Items" }, 5)).to.equal(false)
-			expect(#root.Items).to.equal(1)
-		end)
-
-		it("returns false when target is not an array", function()
-			local root = { Stats = { Coins = 5 } }
-			expect(Shared.arrayRemove(root, { "Stats" }, 1)).to.equal(false)
-		end)
-	end)
-
-	describe("Shared.arrayUpdateSpine", function()
-		it("returns a new root with the array spine cloned", function()
-			local root = { Items = { "a", "b", "c" }, Other = { kept = true } }
-			local newRoot = Shared.arrayUpdateSpine(root, { "Items" }, 2, "B")
-			expect(newRoot).never.to.equal(root)
-			expect(newRoot.Items).never.to.equal(root.Items)
-			expect(newRoot.Other).to.equal(root.Other) -- sibling identity preserved
-			expect(newRoot.Items[2]).to.equal("B")
-			expect(root.Items[2]).to.equal("b") -- original untouched
-		end)
-
-		it("returns root unchanged when target is not an array", function()
-			local root = { Stats = { Coins = 5 } }
-			local newRoot = Shared.arrayUpdateSpine(root, { "Stats" }, 1, "x")
-			expect(newRoot).to.equal(root)
-		end)
-	end)
-
-	describe("Shared.arrayRemoveSpine", function()
-		it("returns a new root with the array shrunk", function()
-			local root = { Items = { "a", "b", "c" }, Other = { kept = true } }
-			local newRoot = Shared.arrayRemoveSpine(root, { "Items" }, 2)
-			expect(newRoot).never.to.equal(root)
-			expect(newRoot.Items).never.to.equal(root.Items)
-			expect(newRoot.Other).to.equal(root.Other)
-			expect(#newRoot.Items).to.equal(2)
-			expect(newRoot.Items[2]).to.equal("c")
-			expect(#root.Items).to.equal(3) -- original untouched
-		end)
-
-		it("returns root unchanged when index is out of bounds", function()
-			local root = { Items = { "a" } }
-			expect(Shared.arrayRemoveSpine(root, { "Items" }, 5)).to.equal(root)
-		end)
-	end)
-
-	describe("Shared.writePath", function()
-		it("does not materialize parents for missing deletes", function()
-			local root = {}
-			local changed = Shared.writePath(root, { "Stats", "Coins" }, nil, false)
-
-			expect(changed).to.equal(false)
-			expect(root.Stats).to.equal(nil)
-		end)
-
-		it("does not materialize parents for invalid inserts", function()
-			local root = {}
-			local changed = Shared.writePath(root, { "Inventory", "Items" }, "Sword", true)
-
-			expect(changed).to.equal(false)
-			expect(root.Inventory).to.equal(nil)
-		end)
-	end)
-
-	describe("Shared.writePathSpine", function()
-		it("returns the same root for missing deletes", function()
-			local root = {}
-			local newRoot = Shared.writePathSpine(root, { "Stats", "Coins" }, nil, false)
-
-			expect(newRoot).to.equal(root)
-			expect(root.Stats).to.equal(nil)
-		end)
-
-		it("returns the same root for invalid inserts", function()
-			local root = {}
-			local newRoot = Shared.writePathSpine(root, { "Inventory", "Items" }, "Sword", true)
-
-			expect(newRoot).to.equal(root)
-			expect(root.Inventory).to.equal(nil)
+		it("rejects selectors that don't return a field", function()
+			expect(pcall(Shared.trace, function()
+				return 1
+			end)).to.equal(false)
+			expect(pcall(Shared.trace, function(data: any)
+				return data["a.b"]
+			end)).to.equal(false)
 		end)
 	end)
 end

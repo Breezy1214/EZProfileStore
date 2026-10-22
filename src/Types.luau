@@ -8,15 +8,47 @@
 
 local Fusion = require(script.Parent.Parent.Fusion)
 local Migrations = require(script.Parent.Migrations)
-local Path = require(script.Parent.Path)
 local Shared = require(script.Parent.Shared)
 local Signal = require(script.Parent.Parent.Signal)
 
 export type Table = Shared.Table
-export type Path<Data, V> = Path.Path<Data, V>
-export type AnyPath<Data> = Path.AnyPath<Data>
-export type Write<Data> = Path.Write<Data>
-export type ReadOnly<T> = Path.ReadOnly<T>
+
+--[=[
+	@type ReadOnly<T> T
+	@within EZProfileStore
+	`T` with every field read-only, recursively.
+]=]
+export type function ReadOnly(value: type)
+	local function convert(current: type, depth: number): type
+		if depth == 0 then
+			return current
+		elseif current:is("union") or current:is("intersection") then
+			local components = {}
+			for _, component in current:components() do
+				table.insert(components, convert(component, depth - 1))
+			end
+			return if current:is("union")
+				then types.unionof(table.unpack(components))
+				else types.intersectionof(table.unpack(components))
+		elseif not current:is("table") then
+			return current
+		end
+
+		local result = types.newtable()
+		for key, prop in current:properties() do
+			if prop.read then
+				result:setreadproperty(key, convert(prop.read, depth - 1))
+			end
+		end
+		local indexer = current:indexer()
+		if indexer then
+			result:setindexer(indexer.index, convert(indexer.readresult, depth - 1))
+		end
+		return result
+	end
+
+	return convert(value, 24)
+end
 
 export type PromiseStatus = "Started" | "Resolved" | "Rejected" | "Cancelled"
 
@@ -68,9 +100,9 @@ export type RollbackResult = {
 }
 
 export type LeaderstatEntry<Data> = {
-	path: Path<Data, number> | Path<Data, string>,
 	name: string,
 	type: LeaderstatType,
+	value: (data: ReadOnly<Data>) -> number | string,
 }
 
 export type ProfileConnection = {
@@ -141,8 +173,8 @@ export type ServerConfig<Data> = {
 	remoteParent: Instance?,
 	autoLoadPlayers: boolean?,
 	leaderstats: { LeaderstatEntry<Data> }?,
-	privatePaths: { AnyPath<Data> }?,
-	validate: ((data: Data) -> (boolean, string?))?,
+	privatePaths: { (data: Data) -> unknown }?,
+	validate: ((data: ReadOnly<Data>) -> (boolean, string?))?,
 }
 
 export type MessageHandler = (player: Player, message: Table, processed: () -> ()) -> ()
@@ -152,7 +184,7 @@ export type Server<Data> = {
 	ProfileLoaded: Signal.Signal<Player, Profile<Data>>,
 	ProfileReleased: Signal.Signal<Player>,
 	FirstJoin: Signal.Signal<Player, Data>,
-	DataUpdated: Signal.Signal<Player, string, unknown>,
+	Changed: Signal.Signal<Player, ReadOnly<Data>>,
 	PreSave: Signal.Signal<Player, Data>,
 	PostSave: Signal.Signal<Player, Data>,
 	LastSave: Signal.Signal<Player, LastSaveReason>,
@@ -160,37 +192,20 @@ export type Server<Data> = {
 	ProfileLoadFailed: Signal.Signal<Player, string>,
 	RolledBack: Signal.Signal<RollbackResult>,
 
+	Get: (self: Server<Data>, player: Player) -> ReadOnly<Data>?,
+	GetAsync: (self: Server<Data>, player: Player, timeout: number?) -> ReadOnly<Data>?,
+	Update: (self: Server<Data>, player: Player, transform: (data: Data) -> ...boolean?) -> boolean,
+	UpdateMany: (
+		self: Server<Data>,
+		players: { Player },
+		transform: (drafts: { [Player]: Data }) -> ...boolean?
+	) -> boolean,
+
 	GetProfile: (self: Server<Data>, player: Player) -> Profile<Data>?,
 	GetProfileAsync: (self: Server<Data>, player: Player, timeout: number?) -> Profile<Data>?,
-	GetData: (self: Server<Data>, player: Player) -> ReadOnly<Data>?,
-	GetDataAsync: (self: Server<Data>, player: Player, timeout: number?) -> ReadOnly<Data>?,
 	GetKey: (self: Server<Data>, target: Target) -> string,
 	GetStore: (self: Server<Data>) -> ProfileStore<Data>,
 	IsReady: (self: Server<Data>, player: Player) -> boolean,
-
-	ReadData: <V>(self: Server<Data>, player: Player, path: Path<Data, V>) -> ReadOnly<V>?,
-	UpdateData: <V>(self: Server<Data>, player: Player, path: Path<Data, V>, value: V) -> boolean,
-	InsertData: <V>(self: Server<Data>, player: Player, path: Path<Data, { V }>, value: V) -> boolean,
-	IncrementData: (self: Server<Data>, player: Player, path: Path<Data, number>, delta: number?) -> boolean,
-	DecrementData: (self: Server<Data>, player: Player, path: Path<Data, number>, delta: number?) -> boolean,
-	RemoveData: (self: Server<Data>, player: Player, path: AnyPath<Data>) -> boolean,
-	UpdateArrayItem: <V>(
-		self: Server<Data>,
-		player: Player,
-		path: Path<Data, { V }>,
-		index: number,
-		value: V
-	) -> boolean,
-	RemoveArrayItem: <V>(self: Server<Data>, player: Player, path: Path<Data, { V }>, index: number) -> boolean,
-	BatchSetValues: (self: Server<Data>, player: Player, writes: { Write<Data> }) -> number,
-	Transaction: (self: Server<Data>, transform: () -> ...boolean) -> boolean,
-	Mutate: (self: Server<Data>, player: Player, transform: (draft: Data) -> ...boolean) -> boolean,
-	MutateMany: (
-		self: Server<Data>,
-		players: { Player },
-		transform: (drafts: { [Player]: Data }) -> ...boolean
-	) -> boolean,
-
 	SendMessageAsync: (self: Server<Data>, target: Target, message: Table) -> boolean,
 	OnMessage: (self: Server<Data>, handler: MessageHandler) -> () -> (),
 	SaveAsync: (self: Server<Data>, player: Player) -> boolean,
@@ -224,39 +239,28 @@ export type Ready<T> = {
 }
 
 --[=[
-	@interface Watcher
+	@interface Selection
 	@within Client
-	.Value StateObject<ReadOnly<V>?> -- Reactive value at the watched path.
-	.get () -> ReadOnly<V>? -- Current value.
-	.onChange (self, listener: (newValue: ReadOnly<V>?, oldValue: ReadOnly<V>?) -> ()) -> Connection
+	.State StateObject<V?> -- Fusion state for UI.
+	.Get (self) -> V?
+	.Observe (self, callback: (new: V?, old: V?) -> ()) -> () -> ()
 	.Destroy (self) -> ()
 ]=]
-export type Watcher<V> = {
-	Value: Fusion.StateObject<ReadOnly<V>?>,
-	get: () -> ReadOnly<V>?,
-	onChange: (
-		self: Watcher<V>,
-		listener: (newValue: ReadOnly<V>?, oldValue: ReadOnly<V>?) -> ()
-	) -> Signal.Connection,
-	Destroy: (self: Watcher<V>) -> (),
+export type Selection<V> = {
+	State: Fusion.StateObject<V?>,
+	Get: (self: Selection<V>) -> V?,
+	Observe: (self: Selection<V>, callback: (new: V?, old: V?) -> ()) -> Disconnect,
+	Destroy: (self: Selection<V>) -> (),
 }
 
 export type Client<Data> = {
 	Ready: Ready<ReadOnly<Data>>,
-	Updated: Signal.Signal<{ string }, unknown>,
 
-	GetData: (self: Client<Data>) -> ReadOnly<Data>?,
-	GetDataState: (self: Client<Data>) -> Fusion.StateObject<ReadOnly<Data>?>,
-	GetDataAsync: (self: Client<Data>, timeout: number?) -> ReadOnly<Data>,
-	Read: <V>(self: Client<Data>, path: Path<Data, V>) -> ReadOnly<V>?,
+	Get: (self: Client<Data>) -> ReadOnly<Data>?,
+	GetAsync: (self: Client<Data>, timeout: number?) -> ReadOnly<Data>,
+	Select: <V>(self: Client<Data>, selector: (data: ReadOnly<Data>) -> V) -> Selection<V>,
 	IsReady: (self: Client<Data>) -> boolean,
 	OnReady: (self: Client<Data>, callback: (data: ReadOnly<Data>) -> ()) -> Disconnect,
-	WatchPath: <V>(self: Client<Data>, path: Path<Data, V>) -> Watcher<V>,
-	OnChanged: <V>(
-		self: Client<Data>,
-		path: Path<Data, V>,
-		callback: (newValue: ReadOnly<V>?, oldValue: ReadOnly<V>?) -> ()
-	) -> Disconnect,
 	Destroy: (self: Client<Data>) -> (),
 }
 

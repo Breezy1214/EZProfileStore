@@ -6,8 +6,6 @@
 	Replication and immutable path helpers.
 ]=]
 
-local Path = require(script.Parent.Path)
-
 local Shared = {}
 
 Shared.REMOTE_FOLDER_NAME = "_EZProfileStore"
@@ -18,8 +16,6 @@ Shared.OP = table.freeze({
 	Set = "set",
 	Del = "del",
 	Ins = "ins",
-	AUpd = "aupd",
-	ARm = "arm",
 })
 
 export type Table = { [unknown]: unknown }
@@ -161,19 +157,25 @@ function Shared.validateValue(value: unknown): (boolean, string?)
 	return reason == nil, reason
 end
 
-Shared.isValidKey = Path.isValidKey
+function Shared.isValidKey(key: unknown): boolean
+	return typeof(key) == "string" and key ~= "" and string.find(key, ".", 1, true) == nil
+end
 
-function Shared.isPathAddressable(value: unknown): boolean
-	local tbl = Shared.asTable(value)
-	if tbl == nil then
-		return false
-	end
+local function isPathAddressable(tbl: Table): boolean
 	for key in tbl do
 		if not Shared.isValidKey(key) then
 			return false
 		end
 	end
 	return true
+end
+
+local function isSequence(value: Table): boolean
+	local count = 0
+	for _ in value do
+		count += 1
+	end
+	return count == #value
 end
 
 function Shared.isPrefix(prefix: { string }, path: { string }): boolean
@@ -188,57 +190,89 @@ function Shared.isPrefix(prefix: { string }, path: { string }): boolean
 	return true
 end
 
--- Returns `value` with `paths` removed, cloning only the affected spine.
-function Shared.redact<T>(value: T, paths: { { string } }): T
-	local result = value
-	for _, path in paths do
-		result = Shared.writePathSpine(result, path, nil, false)
-	end
-	return result
+export type Change = {
+	op: string,
+	path: { string },
+	key: string,
+	value: unknown,
+}
+
+local function pushChange(out: { Change }, op: string, path: { string }, value: unknown)
+	table.insert(out, { op = op, path = table.clone(path), key = table.concat(path, "."), value = value })
 end
 
-export type Change = { path: { string }, key: string, value: unknown }
-
-local function diffInto(old: Table, new: Table, prefix: { string }, out: { Change }): unknown
-	local isRoot = #prefix == 0
-	for key, newChild in new do
-		local oldChild = old[key]
-		if oldChild == newChild then
-			continue
-		elseif isRoot and not Shared.isValidKey(key) then
-			return key
-		end
-
-		local path = table.clone(prefix)
-		table.insert(path, key :: string)
-		local oldTable, newTable = Shared.asTable(oldChild), Shared.asTable(newChild)
-		if oldTable and newTable and Shared.isPathAddressable(oldTable) and Shared.isPathAddressable(newTable) then
-			diffInto(oldTable, newTable, path, out)
-		elseif not Shared.deepEqual(oldChild, newChild) then
-			table.insert(out, { path = path, key = table.concat(path, "."), value = newChild })
+local function isAppend(old: Table, new: Table): boolean
+	if not isSequence(old) or not isSequence(new) or #new < #old then
+		return false
+	end
+	for i = 1, #old do
+		if not Shared.deepEqual(old[i], new[i]) then
+			return false
 		end
 	end
+	return true
+end
 
-	for key in old do
-		if new[key] == nil then
-			if isRoot and not Shared.isValidKey(key) then
-				return key
-			end
-			local path = table.clone(prefix)
+-- Appends `old -> new` as minimal set/del/ins changes at `path` (used as a stack, restored on return).
+-- Dictionaries recurse by key, arrays that only grew become inserts, anything else is replaced whole.
+function Shared.diff(old: unknown, new: unknown, path: { string }, out: { Change })
+	if old == new then
+		return
+	end
+
+	local oldTable, newTable = Shared.asTable(old), Shared.asTable(new)
+	if oldTable == nil or newTable == nil then
+		pushChange(out, if new == nil then Shared.OP.Del else Shared.OP.Set, path, new)
+		return
+	end
+
+	if isPathAddressable(oldTable) and isPathAddressable(newTable) then
+		for key, value in newTable do
 			table.insert(path, key :: string)
-			table.insert(out, { path = path, key = table.concat(path, "."), value = nil })
+			Shared.diff(oldTable[key], value, path, out)
+			table.remove(path)
 		end
+		for key in oldTable do
+			if newTable[key] == nil then
+				table.insert(path, key :: string)
+				pushChange(out, Shared.OP.Del, path, nil)
+				table.remove(path)
+			end
+		end
+	elseif isAppend(oldTable, newTable) then
+		for i = #oldTable + 1, #newTable do
+			pushChange(out, Shared.OP.Ins, path, newTable[i])
+		end
+	elseif not Shared.deepEqual(oldTable, newTable) then
+		pushChange(out, Shared.OP.Set, path, newTable)
 	end
-	return nil
 end
 
-function Shared.diff(old: Table, new: Table): ({ Change }?, unknown)
-	local out: { Change } = {}
-	local invalidKey = diffInto(old, new, {}, out)
-	if invalidKey ~= nil then
-		return nil, invalidKey
+local traced: { [unknown]: { string } } = setmetatable({}, { __mode = "k" })
+local TracerMeta = {}
+
+local function tracer(keys: { string }): unknown
+	local proxy = setmetatable({}, TracerMeta)
+	traced[proxy] = keys
+	return proxy
+end
+
+function TracerMeta.__index(proxy: unknown, key: unknown): unknown
+	if not Shared.isValidKey(key) then
+		error(`EZProfileStore: invalid key {tostring(key)} in selector`, 2)
 	end
-	return out, nil
+	local keys = table.clone(traced[proxy])
+	table.insert(keys, key :: string)
+	return tracer(keys)
+end
+
+-- Records the field path a selector like `function(data) return data.Admin.Notes end` reads.
+function Shared.trace<Data>(selector: (data: Data) -> unknown): { string }
+	local keys = traced[selector(tracer({}) :: Data)]
+	if keys == nil or #keys == 0 then
+		error("EZProfileStore: selector must return a field of data, e.g. function(data) return data.Coins end", 3)
+	end
+	return keys
 end
 
 function Shared.splitKey(keyPath: string): { string }
@@ -262,14 +296,6 @@ function Shared.splitKey(keyPath: string): { string }
 	return result
 end
 
-function Shared.resolvePath(input: unknown): ({ string }, string)
-	if not Path.is(input) then
-		error(`EZProfileStore: expected a Path from Path.tree, got {typeof(input)}`, 3)
-	end
-	local path = input :: Path.AnyPath<unknown>
-	return path.__keys, path.__key
-end
-
 function Shared.readPath(data: unknown, path: { string }): unknown
 	local current = data
 	for _, key in path do
@@ -282,141 +308,23 @@ function Shared.readPath(data: unknown, path: { string }): unknown
 	return current
 end
 
-function Shared.readArray(root: unknown, path: { string }): { unknown }?
-	return Shared.asArray(Shared.readPath(root, path))
-end
-
--- Only non-nil set operations create missing parents.
-function Shared.writePath(root: Table, path: { string }, value: unknown, isInsert: boolean): boolean
-	if #path == 0 then
-		return false
-	end
-
-	local createMissingParents = not isInsert and value ~= nil
-	local target = root
-	for i = 1, #path - 1 do
-		local key = path[i]
-		local child = Shared.asTable(target[key])
-		if child == nil then
-			if not createMissingParents then
-				return false
+-- Returns `value` with `paths` removed, cloning only the affected spine so untouched subtrees keep identity.
+function Shared.redact<T>(value: T, paths: { { string } }): T
+	local result: unknown = value
+	for _, path in paths do
+		if #path > 0 and Shared.readPath(result, path) ~= nil then
+			local root = table.clone(result :: Table)
+			local target = root
+			for i = 1, #path - 1 do
+				local nextTarget = table.clone(target[path[i]] :: Table)
+				target[path[i]] = nextTarget
+				target = nextTarget
 			end
-			child = {}
-			target[key] = child
-		end
-		target = child :: Table
-	end
-
-	local finalKey = path[#path]
-	if isInsert then
-		local array = Shared.asArray(target[finalKey])
-		if array == nil then
-			return false
-		end
-		table.insert(array, value)
-		return true
-	end
-
-	if target[finalKey] == value then
-		return false
-	end
-	target[finalKey] = value
-	return true
-end
-
-local function isArrayIndex(arr: { unknown }, index: number): boolean
-	return index % 1 == 0 and index >= 1 and index <= #arr
-end
-
-function Shared.arrayUpdate(root: Table, path: { string }, index: number, value: unknown): boolean
-	if #path == 0 then
-		return false
-	end
-	local arr = Shared.readArray(root, path)
-	if arr == nil or not isArrayIndex(arr, index) then
-		return false
-	end
-	arr[index] = value
-	return true
-end
-
-function Shared.arrayRemove(root: Table, path: { string }, index: number): boolean
-	if #path == 0 then
-		return false
-	end
-	local arr = Shared.readArray(root, path)
-	if arr == nil or not isArrayIndex(arr, index) then
-		return false
-	end
-	table.remove(arr, index)
-	return true
-end
-
-local function cloneSpine(root: unknown, path: { string }): (Table, Table)
-	local newRoot: Table = table.clone(Shared.asTable(root) or {})
-	local target = newRoot
-	for i = 1, #path - 1 do
-		local key = path[i]
-		local child: Table = table.clone(Shared.asTable(target[key]) or {})
-		target[key] = child
-		target = child
-	end
-	return newRoot, target
-end
-
-function Shared.writePathSpine<T>(root: T, path: { string }, value: unknown, isInsert: boolean): T
-	if #path == 0 then
-		return root
-	end
-
-	local finalKey = path[#path]
-	if isInsert or value == nil then
-		local existing = Shared.readPath(root, path)
-		if if isInsert then Shared.asTable(existing) == nil else existing == nil then
-			return root
+			target[path[#path]] = nil
+			result = root
 		end
 	end
-
-	local newRoot, target = cloneSpine(root, path)
-	if isInsert then
-		local newArr = table.clone(target[finalKey] :: { unknown })
-		table.insert(newArr, value)
-		target[finalKey] = newArr
-	else
-		target[finalKey] = value
-	end
-
-	return (newRoot :: unknown) :: T
-end
-
-local function arraySpine<T>(root: T, path: { string }, index: number, value: unknown, isRemove: boolean): T
-	if #path == 0 then
-		return root
-	end
-	local existing = Shared.readArray(root, path)
-	if existing == nil or not isArrayIndex(existing, index) then
-		return root
-	end
-
-	local newRoot, target = cloneSpine(root, path)
-	local finalKey = path[#path]
-	local newArr = table.clone(existing)
-	if isRemove then
-		table.remove(newArr, index)
-	else
-		newArr[index] = value
-	end
-	target[finalKey] = newArr
-
-	return (newRoot :: unknown) :: T
-end
-
-function Shared.arrayUpdateSpine<T>(root: T, path: { string }, index: number, value: unknown): T
-	return arraySpine(root, path, index, value, false)
-end
-
-function Shared.arrayRemoveSpine<T>(root: T, path: { string }, index: number): T
-	return arraySpine(root, path, index, nil, true)
+	return result :: T
 end
 
 return Shared

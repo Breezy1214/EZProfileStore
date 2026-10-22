@@ -20,19 +20,11 @@
 	Resolves with the initial snapshot.
 ]=]
 
---[=[
-	@prop Updated Signal<{ string }, unknown>
-	@within Client
-	Fires for each replicated path update.
-]=]
-
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local RunService = game:GetService("RunService")
 
 local Fusion = require(script.Parent.Parent.Fusion)
-local PathWatcher = require(script.Parent.Parent.PathWatcher)
 local Shared = require(script.Parent.Shared)
-local Signal = require(script.Parent.Parent.Signal)
 local Types = require(script.Parent.Types)
 local Promise = (require(script.Parent.Parent.Promise) :: unknown) :: Types.PromiseLibrary
 
@@ -44,7 +36,7 @@ type Table = Shared.Table
 export type Config<Data> = Types.ClientConfig<Data>
 export type Disconnect = Types.Disconnect
 export type Ready<T> = Types.Ready<T>
-export type Watcher<V> = Types.Watcher<V>
+export type Selection<V> = Types.Selection<V>
 export type Client<Data> = Types.Client<Data>
 
 type PendingBatch = {
@@ -54,6 +46,28 @@ type PendingBatch = {
 
 local Client = {}
 Client.__index = Client
+
+local Selection = {}
+Selection.__index = Selection
+
+type SelectionImpl = typeof(setmetatable(
+	{} :: {
+		State: Fusion.Computed<unknown>,
+		_scope: Fusion.Scope<typeof(Fusion)>,
+	},
+	Selection
+))
+
+local function deepFreeze<T>(value: T): T
+	local tbl = Shared.asTable(value)
+	if tbl ~= nil and not table.isfrozen(tbl) then
+		for _, child in tbl do
+			deepFreeze(child)
+		end
+		table.freeze(tbl)
+	end
+	return value
+end
 
 type Self = typeof(setmetatable(
 	{} :: {
@@ -68,7 +82,6 @@ type Self = typeof(setmetatable(
 		_rejectReady: (reason: unknown) -> (),
 		_isDestroyed: boolean,
 		Ready: Types.Promise,
-		Updated: Signal.Signal<{ string }, unknown>,
 	},
 	Client
 ))
@@ -118,7 +131,6 @@ local function construct(config: Config<Table>?): Self
 		_rejectReady = rejectReady,
 		_isDestroyed = false,
 		Ready = readyPromise,
-		Updated = Signal.new(),
 	}, Client)
 
 	table.insert(
@@ -190,7 +202,7 @@ function Client._handleInit(self: Self, snapshot: Shared.Snapshot)
 		return
 	end
 
-	self._dataValue:set(snapshot.data)
+	self._dataValue:set(deepFreeze(snapshot.data))
 	self._seq = snapshot.seq
 
 	local pending = self._pendingBatches
@@ -200,7 +212,7 @@ function Client._handleInit(self: Self, snapshot: Shared.Snapshot)
 		-- Batches at or below the snapshot sequence are already contained in it.
 		if entry.seq > self._seq then
 			self._seq = entry.seq
-			self:_applyBatch(entry.batch, false)
+			self:_applyBatch(entry.batch)
 		end
 	end
 
@@ -233,120 +245,151 @@ function Client._handleUpdate(self: Self, seq: unknown, payload: unknown)
 		return
 	end
 	self._seq = seq
-	self:_applyBatch(batch, true)
+	self:_applyBatch(batch)
 end
 
-function Client._applyBatch(self: Self, batch: { unknown }, fireSignal: boolean)
-	local current = Fusion.peek(self._dataValue)
-	if current == nil then
+-- Copy-on-write per batch: each table on a changed path is cloned once, written in place, and
+-- frozen at the end, so untouched subtrees keep their identity for selections.
+function Client._applyBatch(self: Self, batch: { unknown })
+	local root = Fusion.peek(self._dataValue)
+	if root == nil then
 		return
 	end
 
-	local newData: Table = current
-	local fired: { unknown }? = if fireSignal then table.create(#batch * 2) else nil
+	local owned: { [Table]: true } = {}
+	local function own(tbl: Table): Table
+		if owned[tbl] then
+			return tbl
+		end
+		local copy = table.clone(tbl)
+		owned[copy] = true
+		return copy
+	end
 
+	local received: { unknown } = {}
 	for _, item in batch do
 		local entry = Shared.asArray(item)
-		if entry == nil then
+		local opcode = if entry then entry[1] else nil
+		local pathStr = if entry then entry[2] else nil
+		if
+			typeof(pathStr) ~= "string"
+			or (opcode ~= Shared.OP.Set and opcode ~= Shared.OP.Del and opcode ~= Shared.OP.Ins)
+		then
 			continue
 		end
-		local opcode, pathStr = entry[1], entry[2]
-		if typeof(opcode) ~= "string" or typeof(pathStr) ~= "string" then
-			continue
-		end
-
 		local path = Shared.splitKey(pathStr)
-		if #path == 0 then
+		local value = if opcode == Shared.OP.Del then nil else (entry :: { unknown })[3]
+		local isInsert = opcode == Shared.OP.Ins
+		local existing = Shared.readPath(root, path)
+		if #path == 0 or (isInsert and Shared.asTable(existing) == nil) or (value == nil and existing == nil) then
 			continue
 		end
 
-		local arg, value = entry[3], entry[4]
-		local fireValue: unknown = nil
-		if opcode == Shared.OP.Set then
-			newData = Shared.writePathSpine(newData, path, arg, false)
-			fireValue = arg
-		elseif opcode == Shared.OP.Del then
-			newData = Shared.writePathSpine(newData, path, nil, false)
-		elseif opcode == Shared.OP.Ins then
-			newData = Shared.writePathSpine(newData, path, arg, true)
-			fireValue = arg
-		elseif opcode == Shared.OP.AUpd and typeof(arg) == "number" then
-			newData = Shared.arrayUpdateSpine(newData, path, arg, value)
-			fireValue = value
-		elseif opcode == Shared.OP.ARm and typeof(arg) == "number" then
-			newData = Shared.arrayRemoveSpine(newData, path, arg)
+		root = own(root :: Table)
+		local target = root :: Table
+		for i = 1, #path - 1 do
+			local current = Shared.asTable(target[path[i]])
+			local nextTarget = if current then own(current) else {}
+			owned[nextTarget] = true
+			target[path[i]] = nextTarget
+			target = nextTarget
+		end
+		local finalKey = path[#path]
+		if isInsert then
+			local array = own(existing :: Table)
+			array[#array + 1] = value
+			target[finalKey] = array
 		else
-			continue
+			target[finalKey] = value
 		end
-
-		if fired then
-			table.insert(fired, path)
-			table.insert(fired, fireValue)
+		if typeof(value) == "table" then
+			table.insert(received, value)
 		end
 	end
 
-	self._dataValue:set(newData)
-
-	if fired then
-		for i = 1, #fired, 2 do
-			self.Updated:Fire(fired[i] :: { string }, fired[i + 1])
-		end
+	for _, value in received do
+		deepFreeze(value)
 	end
+	for tbl in owned do
+		table.freeze(tbl)
+	end
+	self._dataValue:set(root)
+end
+
+-- A promise that follows `Ready`; cancelling or timing it out leaves the shared `Ready` untouched.
+local function followReady(self: Self): Types.Promise
+	return Promise.new(function(resolve, reject)
+		self.Ready:andThen(resolve, reject)
+	end)
 end
 
 --[=[
 	Returns the read-only snapshot, if loaded.
 	@within Client
-	@method GetData
+	@method Get
 	@return ReadOnly<Data>?
 ]=]
-function Client.GetData(self: Self): Table?
+function Client.Get(self: Self): Table?
 	return Fusion.peek(self._dataValue)
-end
-
---[=[
-	Returns the snapshot's reactive state for Fusion. Treat it as read-only.
-	@within Client
-	@method GetDataState
-	@return StateObject<ReadOnly<Data>?>
-]=]
-function Client.GetDataState(self: Self): Fusion.Value<Table?>
-	return self._dataValue
 end
 
 --[=[
 	Yields for the initial snapshot. Errors if it fails to load or `timeout` elapses.
 	@within Client
-	@method GetDataAsync
+	@method GetAsync
 	@yields
 	@param timeout number? -- Waits until `Ready` settles by default.
 	@return ReadOnly<Data>
 ]=]
-function Client.GetDataAsync(self: Self, timeout: number?): Table
-	local promise = if timeout == nil
-		then self.Ready
-		else Promise.new(function(resolve, reject)
-			self.Ready:andThen(resolve, reject)
-		end):timeout(timeout)
-
-	local data = Shared.asTable(promise:expect())
-	assert(data ~= nil, "EZProfileStore.Client: snapshot is not a table")
-	return data
+function Client.GetAsync(self: Self, timeout: number?): Table
+	local promise = if timeout == nil then self.Ready else followReady(self):timeout(timeout)
+	return promise:expect() :: Table
 end
 
 --[=[
-	Reads a path from the snapshot.
+	Returns a live view of part of the data, e.g. `client:Select(function(data) return data.Coins end)`.
 	@within Client
-	@method Read
-	@param path Path<Data, V>
-	@return ReadOnly<V>?
+	@method Select
+	@param selector (data: ReadOnly<Data>) -> V
+	@return Selection<V>
 ]=]
-function Client.Read(self: Self, path: unknown): unknown
-	local current = Fusion.peek(self._dataValue)
-	if current == nil then
-		return nil
+function Client.Select(self: Self, selector: (data: Table) -> unknown): SelectionImpl
+	assert(typeof(selector) == "function", "Select expects a selector function")
+	local scope = self._scope
+	assert(scope ~= nil, "EZProfileStore.Client was destroyed")
+
+	local inner = scope:innerScope()
+	local dataValue = self._dataValue
+	local state = inner:Computed(function(use): unknown
+		local data = use(dataValue)
+		return if data == nil then nil else selector(data)
+	end)
+	return setmetatable({ State = state, _scope = inner }, Selection)
+end
+
+function Selection.Get(self: SelectionImpl): unknown
+	return Fusion.peek(self.State)
+end
+
+function Selection.Observe(self: SelectionImpl, callback: (new: unknown, old: unknown) -> ()): Disconnect
+	local previous = Fusion.peek(self.State)
+	local observerScope = self._scope:innerScope()
+	observerScope:Observer(self.State):onChange(function()
+		local current = Fusion.peek(self.State)
+		if current == previous then
+			return
+		end
+		local old = previous
+		previous = current
+		callback(current, old)
+	end)
+	return function()
+		observerScope:doCleanup()
 	end
-	return Shared.readPath(current, (Shared.resolvePath(path)))
+end
+
+function Selection.Destroy(self: SelectionImpl)
+	self._scope:doCleanup()
 end
 
 --[=[
@@ -367,13 +410,8 @@ end
 	@return Disconnect
 ]=]
 function Client.OnReady(self: Self, callback: (data: Table) -> ()): Disconnect
-	local chain = Promise.new(function(resolve, reject)
-		self.Ready:andThen(resolve, reject)
-	end):andThen(function(data: unknown)
-		local snapshot = Shared.asTable(data)
-		if snapshot then
-			callback(snapshot)
-		end
+	local chain = followReady(self):andThen(function(data: unknown)
+		callback(data :: Table)
 	end)
 
 	return function()
@@ -382,36 +420,7 @@ function Client.OnReady(self: Self, callback: (data: Table) -> ()): Disconnect
 end
 
 --[=[
-	Creates a caller-owned watcher for `path`; destroy it after use.
-	@within Client
-	@method WatchPath
-	@param path Path<Data, V>
-	@return Watcher<V>
-]=]
-function Client.WatchPath(self: Self, path: unknown): PathWatcher.PathWatcher
-	local keys = Shared.resolvePath(path)
-	local source = (self._dataValue :: unknown) :: Fusion.Value<{ any }>
-	return PathWatcher.new(source, keys, nil)
-end
-
---[=[
-	Subscribes to a path and returns a disconnect function.
-	@within Client
-	@method OnChanged
-	@param path Path<Data, V>
-	@param callback (newValue: ReadOnly<V>?, oldValue: ReadOnly<V>?) -> ()
-	@return Disconnect
-]=]
-function Client.OnChanged(self: Self, path: unknown, callback: (newValue: unknown, oldValue: unknown) -> ()): Disconnect
-	local watcher = self:WatchPath(path)
-	watcher:onChange(callback)
-	return function()
-		watcher:Destroy()
-	end
-end
-
---[=[
-	Disconnects listeners, releases state, and rejects unresolved `Ready`.
+	Disconnects listeners, releases state and selections, and rejects unresolved `Ready`.
 	@within Client
 	@method Destroy
 ]=]
@@ -433,7 +442,6 @@ function Client.Destroy(self: Self)
 		scope:doCleanup()
 		self._scope = nil
 	end
-	self.Updated:Destroy()
 end
 
 return Client

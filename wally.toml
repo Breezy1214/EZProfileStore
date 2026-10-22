@@ -1,6 +1,6 @@
 [package]
 name = "breezy1214/ezprofilestore"
-description = "A ProfileStore wrapper with generic key-path updates and built-in client replication."
+description = "A typed ProfileStore wrapper with draft-based updates and built-in client replication."
 version = "0.1.5"
 license = "MIT"
 realm = "shared"
@@ -11,6 +11,7 @@ exclude = [
 	"ServerPackages",
 	"docs",
 	"tasks",
+	"build",
 	"tests",
 	"dev.project.json",
 	"test.project.json",
@@ -26,7 +27,6 @@ exclude = [
 [dependencies]
 Promise = "evaera/promise@4.0.0"
 Signal = "sleitnick/signal@2.0.3"
-PathWatcher = "breezy1214/pathwatcher@0.1.2"
 Fusion = "elttob/fusion@0.3.0"
 
 [server-dependencies]

@@ -1,0 +1,55 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_call:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  checks:
+    name: Lint, types, build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: CompeyDev/setup-rokit@v0.2.1
+        with:
+          cache: true
+
+      - name: Install packages
+        run: |
+          wally install
+          rojo sourcemap dev.project.json -o sourcemap.json
+          wally-package-types --sourcemap sourcemap.json Packages/
+          wally-package-types --sourcemap sourcemap.json ServerPackages/
+
+      - name: Format
+        run: stylua --check src tests
+
+      - name: Lint
+        run: selene src tests
+
+      - name: Package layout
+        run: node tests/package-compat.test.mjs
+
+      - name: Types
+        run: |
+          curl -fsSL -o "$RUNNER_TEMP/globalTypes.d.luau" \
+            https://raw.githubusercontent.com/JohnnyMorganz/luau-lsp/main/scripts/globalTypes.None.d.luau
+          ROBLOX_DEFS="$RUNNER_TEMP/globalTypes.d.luau" sh tests/types/check.sh
+
+      - name: Build
+        run: |
+          rojo build default.project.json -o EZProfileStore.rbxm
+          wally package --list
+
+      - name: Docs
+        run: npx --yes moonwave@1 build --code src --out-dir build/docs

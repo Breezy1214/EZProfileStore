@@ -20,17 +20,17 @@
 	.migrationMetadataKey string? -- Defaults to `"EZProfileStoreVersion"`.
 	.remoteParent Instance? -- Defaults to `ReplicatedStorage`.
 	.autoLoadPlayers boolean? -- Start sessions for joining players. Defaults to `true`; set `false` in unit tests.
-	.leaderstats { LeaderstatEntry<Data> }? -- Mirrored profile paths.
-	.privatePaths { AnyPath<Data> }? -- Server-only paths that never replicate.
-	.validate ((data: Data) -> (boolean, string?))? -- Checked on load and by `Mutate`.
+	.leaderstats { LeaderstatEntry<Data> }? -- Values shown in the player list, in order.
+	.privatePaths { (data: Data) -> unknown }? -- Selectors for server-only fields, e.g. `function(d) return d.Moderation end`.
+	.validate ((data: ReadOnly<Data>) -> (boolean, string?))? -- Checked on load and before every `Update` commits.
 ]=]
 
 --[=[
 	@interface LeaderstatEntry
 	@within Server
-	.path Path<Data, number> | Path<Data, string>
 	.name string
 	.type "IntValue" | "NumberValue" | "StringValue"
+	.value (data: ReadOnly<Data>) -> number | string
 ]=]
 
 --[=[
@@ -52,9 +52,9 @@
 ]=]
 
 --[=[
-	@prop DataUpdated Signal<Player, string, unknown>
+	@prop Changed Signal<Player, ReadOnly<Data>>
 	@within Server
-	Fires after a replicated mutation with the dot-joined path (compare with `Path.keyOf(path)`) and new value.
+	Fires after an `Update` commits changes for a player.
 ]=]
 
 --[=[
@@ -113,9 +113,6 @@ local DEFAULT_KEY_PREFIX = "Player_"
 local DEFAULT_MIGRATION_METADATA_KEY = "EZProfileStoreVersion"
 
 type Table = Types.Table
-type Path<Data, V> = Types.Path<Data, V>
-type AnyPath<Data> = Types.AnyPath<Data>
-type Write<Data> = Types.Write<Data>
 export type StoreMode = Types.StoreMode
 export type Target = Types.Target
 type LastSaveReason = Types.LastSaveReason
@@ -137,29 +134,9 @@ type RollbackSelection = {
 }
 
 type ResolvedLeaderstatEntry = {
-	path: { string },
-	pathStr: string,
 	name: string,
 	type: LeaderstatType,
-}
-
-type HeldUpdate = {
-	player: Player,
-	opcode: string,
-	pathStr: string,
-	valueOrIndex: unknown,
-	value: unknown,
-}
-type HeldEvent = {
-	player: Player,
-	pathStr: string,
-	value: unknown,
-}
-type TransactionState = {
-	undo: { () -> () },
-	updates: { HeldUpdate },
-	events: { HeldEvent },
-	players: { [Player]: true },
+	value: (data: Table) -> unknown,
 }
 
 type MessageHandlerEntry = {
@@ -196,14 +173,14 @@ type Self = typeof(setmetatable(
 		_validate: ((data: Table) -> (boolean, string?))?,
 		_messageHandlers: { MessageHandlerEntry },
 		_leaderstatsConfig: { ResolvedLeaderstatEntry },
-		_leaderstats: { [Player]: { [string]: ValueBase } },
+		_leaderstats: { [Player]: { ValueBase } },
 		_rollbackPreviews: { [RollbackResult]: RollbackSelection },
-		_transaction: TransactionState?,
+		_isUpdating: boolean,
 		IsMock: boolean,
 		ProfileLoaded: Signal.Signal<Player, Profile<Table>>,
 		ProfileReleased: Signal.Signal<Player>,
 		FirstJoin: Signal.Signal<Player, Table>,
-		DataUpdated: Signal.Signal<Player, string, unknown>,
+		Changed: Signal.Signal<Player, Table>,
 		PreSave: Signal.Signal<Player, Table>,
 		PostSave: Signal.Signal<Player, Table>,
 		LastSave: Signal.Signal<Player, LastSaveReason>,
@@ -307,22 +284,21 @@ local function validateLeaderstats(template: Table, entries: { LeaderstatEntry<T
 	for i, entry in entries do
 		assert(typeof(entry) == "table", `leaderstats[{i}] must be a table`)
 		assert(typeof(entry.name) == "string" and #entry.name > 0, `leaderstats[{i}].name must be a non-empty string`)
+		assert(typeof(entry.value) == "function", `leaderstats[{i}].value must be a function`)
 		local expectedType = LEADERSTAT_TYPE_TO_LUA[entry.type]
 		assert(expectedType ~= nil, `leaderstats[{i}].type must be IntValue, NumberValue, or StringValue`)
 
-		local path, pathStr = Shared.resolvePath(entry.path)
-		local current = Shared.readPath(template, path)
-		assert(current ~= nil, `leaderstats[{i}].path "{pathStr}" does not exist in template`)
+		local ok, current = pcall(entry.value, template)
+		assert(ok, `leaderstats[{i}] ("{entry.name}") errored on the template: {current}`)
 		assert(
 			typeof(current) == expectedType,
-			`leaderstats[{i}].path "{pathStr}" is {typeof(current)} but declared {entry.type}`
+			`leaderstats[{i}] ("{entry.name}") returns {typeof(current)} but declared {entry.type}`
 		)
 
 		table.insert(resolved, {
-			path = path,
-			pathStr = pathStr,
 			name = entry.name,
 			type = entry.type,
+			value = entry.value,
 		})
 	end
 	return resolved
@@ -341,15 +317,10 @@ local function resolveMigrations(configured: (Migrations.Migrations | { Migratio
 	return Migrations.new((candidate :: unknown) :: { Migrations.Input })
 end
 
-local function resolvePrivatePaths(configured: { AnyPath<Table> }?): { { string } }
+local function resolvePrivatePaths(configured: { (data: Table) -> unknown }?): { { string } }
 	local resolved: { { string } } = {}
-	if configured == nil then
-		return resolved
-	end
-	for i, entry in configured do
-		local path = Shared.resolvePath(entry)
-		assert(#path > 0, `privatePaths[{i}] must not be empty`)
-		table.insert(resolved, path)
+	for _, selector in configured or {} do
+		table.insert(resolved, Shared.trace(selector))
 	end
 	return resolved
 end
@@ -375,7 +346,7 @@ local function runValidator(validate: ((data: Table) -> (boolean, string?))?, da
 	return true, nil
 end
 
-local function runTransform<A...>(transform: (A...) -> ...boolean, ...: A...): string?
+local function runTransform<A...>(transform: (A...) -> ...boolean?, ...: A...): string?
 	local thread = coroutine.create(transform)
 	local ok, result = coroutine.resume(thread, ...)
 	if coroutine.status(thread) ~= "dead" then
@@ -387,12 +358,6 @@ local function runTransform<A...>(transform: (A...) -> ...boolean, ...: A...): s
 		return ""
 	end
 	return nil
-end
-
-local function truncate<T>(list: { T }, length: number)
-	for i = #list, length + 1, -1 do
-		list[i] = nil
-	end
 end
 
 local function resolveMode(config: Config<Table>): StoreMode
@@ -427,6 +392,11 @@ local function writeLeaderstat(instance: ValueBase, value: unknown)
 			target.Value = value
 		end
 	end
+end
+
+local function readLeaderstat(entry: ResolvedLeaderstatEntry, data: Table): unknown
+	local ok, value = pcall(entry.value, data)
+	return if ok then value else nil
 end
 
 local function isProfileActive(profile: Profile<Table>?): boolean
@@ -508,12 +478,12 @@ local function construct(config: Config<Table>): Self
 		_leaderstatsConfig = resolvedLeaderstats,
 		_leaderstats = {},
 		_rollbackPreviews = {},
-		_transaction = nil,
+		_isUpdating = false,
 		IsMock = isMock,
 		ProfileLoaded = Signal.new(),
 		ProfileReleased = Signal.new(),
 		FirstJoin = Signal.new(),
-		DataUpdated = Signal.new(),
+		Changed = Signal.new(),
 		PreSave = Signal.new(),
 		PostSave = Signal.new(),
 		LastSave = Signal.new(),
@@ -571,9 +541,9 @@ end
 ]=]
 function Server.mock<Data>(config: Config<Data>): Server<Data>
 	assert(typeof(config) == "table", "Server.mock expects a config table")
-	local resolved = table.clone(config)
+	local resolved = table.clone((config :: unknown) :: Config<Table>)
 	resolved.mode = "mock"
-	return Server.new(resolved)
+	return (construct(resolved) :: unknown) :: Server<Data>
 end
 
 function Server._waitForProfile(self: Self, player: Player, timeout: number?): Profile<Table>?
@@ -844,7 +814,7 @@ function Server._buildLeaderstats(self: Self, player: Player)
 		return
 	end
 
-	local data = self:GetData(player)
+	local data = self:Get(player)
 	if not data then
 		return
 	end
@@ -852,12 +822,12 @@ function Server._buildLeaderstats(self: Self, player: Player)
 	local folder = Instance.new("Folder")
 	folder.Name = "leaderstats"
 
-	local mirror: { [string]: ValueBase } = {}
+	local mirror: { ValueBase } = {}
 	local leaderstatCount = #self._leaderstatsConfig
 
 	for index, entry in self._leaderstatsConfig do
 		local stat = newLeaderstat(entry.type)
-		writeLeaderstat(stat, Shared.readPath(data, entry.path))
+		writeLeaderstat(stat, readLeaderstat(entry, data))
 
 		local instance: Instance = stat
 		instance.Name = entry.name
@@ -868,7 +838,7 @@ function Server._buildLeaderstats(self: Self, player: Player)
 		priority.Parent = instance
 
 		instance.Parent = folder
-		mirror[entry.pathStr] = stat
+		mirror[index] = stat
 	end
 
 	self._leaderstats[player] = mirror
@@ -881,154 +851,168 @@ function Server._mirrorLeaderstats(self: Self, player: Player)
 		return
 	end
 
-	local data = self:GetData(player)
+	local data = self:Get(player)
 	if not data then
 		return
 	end
 
-	for _, entry in self._leaderstatsConfig do
-		local instance = mirror[entry.pathStr]
-		if instance then
-			writeLeaderstat(instance, Shared.readPath(data, entry.path))
-		end
+	for index, entry in self._leaderstatsConfig do
+		writeLeaderstat(mirror[index], readLeaderstat(entry, data))
 	end
 end
 
-local function captureSetUndo(data: Table, path: { string }): () -> ()
-	local target = data
-	for i = 1, #path - 1 do
-		local key = path[i]
-		local child = Shared.asTable(target[key])
-		if child == nil then
-			local parent, old = target, target[key]
-			return function()
-				parent[key] = old
-			end
+local NONE = table.freeze({})
+
+-- Unit of work for one profile: top-level writes are recorded, and a top-level table is deep-copied
+-- the first time it is read, so `table.insert`, `#`, and generalized iteration work on real tables.
+type Draft = {
+	live: Table,
+	copies: { [unknown]: Table },
+	sets: { [string]: unknown },
+}
+
+local drafts: { [unknown]: Draft } = setmetatable({}, { __mode = "k" })
+local DraftMeta = {}
+
+local function getDraft(proxy: unknown): Draft
+	local draft = drafts[proxy]
+	if draft == nil then
+		error("EZProfileStore: a draft cannot be used after its Update returns", 3)
+	end
+	return draft
+end
+
+local function draftRead(draft: Draft, key: unknown): unknown
+	if typeof(key) == "string" then
+		local set = draft.sets[key]
+		if set ~= nil then
+			return if set == NONE then nil else set
 		end
-		target = child
+	end
+	local copy = draft.copies[key]
+	if copy ~= nil then
+		return copy
+	end
+	local value = draft.live[key]
+	local tbl = Shared.asTable(value)
+	if tbl == nil then
+		return value
+	end
+	copy = Shared.deepCopy(tbl)
+	draft.copies[key] = copy
+	return copy
+end
+
+function DraftMeta.__index(proxy: unknown, key: unknown): unknown
+	return draftRead(getDraft(proxy), key)
+end
+
+function DraftMeta.__newindex(proxy: unknown, key: unknown, value: unknown)
+	local draft = getDraft(proxy)
+	if not Shared.isValidKey(key) then
+		error(`EZProfileStore: invalid key {tostring(key)}; keys must be non-empty strings without "."`, 2)
+	end
+	draft.copies[key] = nil
+	draft.sets[key :: string] = if value == nil then NONE else value
+end
+
+function DraftMeta.__iter(proxy: unknown): () -> (unknown, unknown)
+	local draft = getDraft(proxy)
+	local keys: { unknown } = {}
+	for key in draft.live do
+		if typeof(key) ~= "string" or draft.sets[key] ~= NONE then
+			table.insert(keys, key)
+		end
+	end
+	for key, value in draft.sets do
+		if value ~= NONE and draft.live[key] == nil then
+			table.insert(keys, key)
+		end
 	end
 
-	local parent, key = target, path[#path]
-	local old = parent[key]
+	local index = 0
 	return function()
-		parent[key] = old
+		index += 1
+		local key = keys[index]
+		if key == nil then
+			return nil, nil
+		end
+		return key, draftRead(draft, key)
 	end
 end
 
-function Server._recordUndo(self: Self, player: Player, undo: () -> ())
-	local transaction = self._transaction
-	if transaction then
-		table.insert(transaction.undo, undo)
-		transaction.players[player] = true
-	end
+local function newDraft(live: Table): (Table, Draft)
+	local draft: Draft = { live = live, copies = {}, sets = {} }
+	local proxy = setmetatable({}, DraftMeta)
+	drafts[proxy] = draft
+	return proxy, draft
 end
 
-function Server._write(
-	self: Self,
-	player: Player,
-	data: Table,
-	path: { string },
-	value: unknown,
-	isInsert: boolean
-): boolean
-	local transaction = self._transaction
-	local insertTarget = if transaction and isInsert then Shared.readArray(data, path) else nil
-	local setUndo = if transaction and not isInsert then captureSetUndo(data, path) else nil
-
-	if not Shared.writePath(data, path, value, isInsert) then
-		return false
-	end
-	if insertTarget then
-		self:_recordUndo(player, function()
-			table.remove(insertTarget)
-		end)
-	elseif setUndo then
-		self:_recordUndo(player, setUndo)
-	end
-	return true
+local function isTouched(draft: Draft): boolean
+	return next(draft.sets) ~= nil or next(draft.copies) ~= nil
 end
 
-function Server._arrayWrite(
-	self: Self,
-	player: Player,
-	data: Table,
-	path: { string },
-	index: number,
-	value: unknown,
-	isRemove: boolean
-): boolean
-	local array = if self._transaction then Shared.readArray(data, path) else nil
-	local old = if array then array[index] else nil
-	local changed = if isRemove
-		then Shared.arrayRemove(data, path, index)
-		else Shared.arrayUpdate(data, path, index, value)
-	if not changed then
-		return false
+-- A plain table of the draft's result for `validate`; nested tables are the draft's own copies.
+local function draftView(draft: Draft): Table
+	local view = table.clone(draft.live)
+	for key, copy in draft.copies do
+		view[key] = copy
 	end
+	for key, value in draft.sets do
+		view[key] = if value == NONE then nil else value
+	end
+	return view
+end
 
-	if array then
-		self:_recordUndo(player, function()
-			if isRemove then
-				table.insert(array, index, old)
-			else
-				array[index] = old
+-- Minimal set/del/ins changes the draft makes to live data, or nil and a reason. Assigned tables
+-- are copied here so callers can't alias live data.
+local function collectChanges(draft: Draft): ({ Shared.Change }?, string?)
+	local changes: { Shared.Change } = {}
+	for key, value in draft.sets do
+		if value ~= NONE then
+			local ok, reason = Shared.validateValue(value)
+			if not ok then
+				return nil, `"{key}": {reason}`
 			end
-		end)
+			value = Shared.deepCopy(value)
+			draft.sets[key] = value
+		end
+		Shared.diff(draft.live[key], if value == NONE then nil else value, { key }, changes)
 	end
-	return true
-end
 
-function Server._validatePlayers(self: Self, players: { [Player]: true }): string?
-	for player in players do
-		local data = self:GetData(player)
-		if data then
-			local valid, reason = runValidator(self._validate, data)
-			if not valid then
-				return `rejected by validate: {reason}`
+	local copiedFrom = #changes + 1
+	for key, copy in draft.copies do
+		if not Shared.isValidKey(key) then
+			return nil, `key {tostring(key)} cannot be replicated`
+		end
+		Shared.diff(draft.live[key], copy, { key :: string }, changes)
+	end
+	for i = copiedFrom, #changes do
+		local change = changes[i]
+		if change.value ~= nil then
+			local ok, reason = Shared.validateValue(change.value)
+			if not ok then
+				return nil, `"{change.key}": {reason}`
 			end
 		end
 	end
-	return nil
+	return changes, nil
 end
 
-function Server._emitUpdated(self: Self, player: Player, pathStr: string, value: unknown)
-	local transaction = self._transaction
-	if transaction then
-		table.insert(transaction.events, { player = player, pathStr = pathStr, value = value })
-	else
-		self.DataUpdated:Fire(player, pathStr, value)
+-- Swaps changed top-level values into live data.
+local function commitDraft(draft: Draft, changes: { Shared.Change })
+	local touched: { [string]: true } = {}
+	for _, change in changes do
+		touched[change.path[1]] = true
 	end
-end
-
-function Server._applySet(
-	self: Self,
-	player: Player,
-	data: Table,
-	path: { string },
-	pathStr: string,
-	value: unknown
-): boolean
-	if not self:_write(player, data, path, value, false) then
-		return false
+	for key in touched do
+		local set = draft.sets[key]
+		if set ~= nil then
+			draft.live[key] = if set == NONE then nil else set
+		else
+			draft.live[key] = draft.copies[key]
+		end
 	end
-	self:_queueUpdate(player, if value == nil then Shared.OP.Del else Shared.OP.Set, path, pathStr, value)
-	return true
-end
-
--- Sets or deletes one path, then replicates and signals the change.
-function Server._commitSet(
-	self: Self,
-	player: Player,
-	data: Table,
-	path: { string },
-	pathStr: string,
-	value: unknown
-): boolean
-	if not self:_applySet(player, data, path, pathStr, value) then
-		return false
-	end
-	self:_emitUpdated(player, pathStr, value)
-	return true
 end
 
 function Server._isPrivate(self: Self, path: { string }): boolean
@@ -1040,62 +1024,27 @@ function Server._isPrivate(self: Self, path: { string }): boolean
 	return false
 end
 
--- Copies at queue time so later in-frame writes cannot leak into this op's payload.
-function Server._replicatedCopy(self: Self, path: { string }, value: unknown, stripPrivate: boolean): unknown
-	local copy = Shared.deepCopy(value)
-	local copyTable = Shared.asTable(copy)
-	if stripPrivate and copyTable then
-		for _, privatePath in self._privatePaths do
-			if #privatePath > #path and Shared.isPrefix(path, privatePath) then
-				Shared.writePath(copyTable, table.move(privatePath, #path + 1, #privatePath, 1, {}), nil, false)
-			end
+-- `value` without the private paths nested under `path`; live data is never touched.
+function Server._redactBelow(self: Self, path: { string }, value: unknown): unknown
+	if typeof(value) ~= "table" then
+		return value
+	end
+	local relative: { { string } }? = nil
+	for _, privatePath in self._privatePaths do
+		if #privatePath > #path and Shared.isPrefix(path, privatePath) then
+			relative = relative or {}
+			table.insert(relative :: { { string } }, table.move(privatePath, #path + 1, #privatePath, 1, {}))
 		end
 	end
-	return copy
+	return if relative then Shared.redact(value, relative) else value
 end
 
-function Server._queueUpdate(
-	self: Self,
-	player: Player,
-	opcode: string,
-	path: { string },
-	pathStr: string,
-	valueOrIndex: unknown?,
-	value: unknown?
-)
-	if self._leaderstats[player] then
-		self._dirtyLeaderstats[player] = true
-		self:_scheduleFlush()
-	end
-	if self:_isPrivate(path) then
+function Server._queueUpdate(self: Self, player: Player, change: Shared.Change)
+	if self:_isPrivate(change.path) then
 		return
 	end
+	local value = if change.op == Shared.OP.Set then self:_redactBelow(change.path, change.value) else change.value
 
-	valueOrIndex = self:_replicatedCopy(path, valueOrIndex, opcode == Shared.OP.Set)
-	value = self:_replicatedCopy(path, value, false)
-
-	local transaction = self._transaction
-	if transaction then
-		table.insert(transaction.updates, {
-			player = player,
-			opcode = opcode,
-			pathStr = pathStr,
-			valueOrIndex = valueOrIndex,
-			value = value,
-		})
-		return
-	end
-	self:_appendToBatch(player, opcode, pathStr, valueOrIndex, value)
-end
-
-function Server._appendToBatch(
-	self: Self,
-	player: Player,
-	opcode: string,
-	pathStr: string,
-	valueOrIndex: unknown,
-	value: unknown
-)
 	local batch = self._pendingBatches[player]
 	if not batch then
 		batch = {}
@@ -1103,25 +1052,21 @@ function Server._appendToBatch(
 		self._sequences[player] = (self._sequences[player] or 0) + 1
 	end
 
-	-- Stop at first non-set/del to preserve order against ins/aupd/arm.
-	if opcode == Shared.OP.Set or opcode == Shared.OP.Del then
-		for i = #batch, 1, -1 do
-			local entry = batch[i]
-			local entryOp = entry[1]
-			if entryOp ~= Shared.OP.Set and entryOp ~= Shared.OP.Del then
-				break
-			end
-			if entry[2] == pathStr then
-				entry[1] = opcode
-				entry[3] = valueOrIndex
-				self:_scheduleFlush()
-				return
-			end
-		end
+	-- Only the last entry can be merged; an earlier one may have later writes beneath it.
+	local count = #batch
+	local last: Shared.Update = batch[count]
+	if
+		count > 0
+		and change.op ~= Shared.OP.Ins
+		and last[2] == change.key
+		and (last[1] == Shared.OP.Set or last[1] == Shared.OP.Del)
+	then
+		last[1] = change.op
+		last[3] = value
+	else
+		local entry: Shared.Update = { change.op, change.key, value }
+		table.insert(batch, entry)
 	end
-
-	local entry: Shared.Update = { opcode, pathStr, valueOrIndex, value }
-	table.insert(batch, entry)
 	self:_scheduleFlush()
 end
 
@@ -1187,13 +1132,13 @@ function Server.GetProfileAsync(self: Self, player: Player, timeout: number?): P
 end
 
 --[=[
-	Returns the active profile's data, typed read-only.
+	Returns the player's live data, typed read-only. Change it with `Update`.
 	@within Server
-	@method GetData
+	@method Get
 	@param player Player
 	@return ReadOnly<Data>?
 ]=]
-function Server.GetData(self: Self, player: Player): Table?
+function Server.Get(self: Self, player: Player): Table?
 	local profile = self:GetProfile(player)
 	return if profile then profile.Data else nil
 end
@@ -1201,17 +1146,17 @@ end
 --[=[
 	Yields for active profile data.
 	@within Server
-	@method GetDataAsync
+	@method GetAsync
 	@yields
 	@param player Player
 	@param timeout number? -- Waits until the profile loads, fails, or the player leaves by default.
 	@return ReadOnly<Data>?
 ]=]
-function Server.GetDataAsync(self: Self, player: Player, timeout: number?): Table?
+function Server.GetAsync(self: Self, player: Player, timeout: number?): Table?
 	if self:GetProfileAsync(player, timeout) == nil then
 		return nil
 	end
-	return self:GetData(player)
+	return self:Get(player)
 end
 
 --[=[
@@ -1247,356 +1192,98 @@ function Server.GetStore(self: Self): ProfileStore<Table>
 end
 
 --[=[
-	Reads a profile path.
+	Edits the player's data as plain Luau and commits it all-or-nothing. Return `false` to abort.
 	@within Server
-	@method ReadData
+	@method Update
 	@param player Player
-	@param path Path<Data, V>
-	@return ReadOnly<V>?
+	@param transform (data: Data) -> ...boolean?
+	@return boolean -- `true` if the update committed.
 ]=]
-function Server.ReadData(self: Self, player: Player, path: unknown): unknown
-	local data = self:GetData(player)
-	if not data then
-		return nil
-	end
-	return Shared.readPath(data, (Shared.resolvePath(path)))
-end
-
---[=[
-	Sets a profile path. Use `RemoveData` to delete one.
-	@within Server
-	@method UpdateData
-	@param player Player
-	@param path Path<Data, V>
-	@param value V
-	@return boolean -- `true` if the value changed, `false` otherwise.
-]=]
-function Server.UpdateData(self: Self, player: Player, path: unknown, value: unknown): boolean
-	local keys, pathStr = Shared.resolvePath(path)
-	local data = self:GetData(player)
-	if not data then
-		return false
-	end
-	if value ~= nil and not checkSavable("UpdateData", pathStr, value) then
-		return false
-	end
-
-	return self:_commitSet(player, data, keys, pathStr, value)
-end
-
---[=[
-	Appends to an array path.
-	@within Server
-	@method InsertData
-	@param player Player
-	@param path Path<Data, { V }>
-	@param value V
-	@return boolean -- `true` on success, `false` if the target is not a table.
-]=]
-function Server.InsertData(self: Self, player: Player, path: unknown, value: unknown): boolean
-	local keys, pathStr = Shared.resolvePath(path)
-	local data = self:GetData(player)
-	if not data then
-		return false
-	end
-	if not checkSavable("InsertData", pathStr, value) then
-		return false
-	end
-
-	if not self:_write(player, data, keys, value, true) then
-		warn(`EZProfileStore: InsertData target at "{pathStr}" is not a table`)
-		return false
-	end
-
-	self:_queueUpdate(player, Shared.OP.Ins, keys, pathStr, value)
-	self:_emitUpdated(player, pathStr, value)
-	return true
-end
-
---[=[
-	Adds `delta` to a numeric path.
-	@within Server
-	@method IncrementData
-	@param player Player
-	@param path Path<Data, number>
-	@param delta number? -- Defaults to `1`.
-	@return boolean
-]=]
-function Server.IncrementData(self: Self, player: Player, path: unknown, delta: number?): boolean
-	local keys, pathStr = Shared.resolvePath(path)
-	local data = self:GetData(player)
-	if not data then
-		return false
-	end
-
-	local current = Shared.readPath(data, keys)
-	local base: number
-	if current == nil then
-		base = 0
-	elseif typeof(current) == "number" then
-		base = current
-	else
-		warn(`EZProfileStore: IncrementData target at "{pathStr}" is not a number`)
-		return false
-	end
-
-	local newValue = base + (delta or 1)
-	if not checkSavable("IncrementData", pathStr, newValue) then
-		return false
-	end
-	return self:_commitSet(player, data, keys, pathStr, newValue)
-end
-
---[=[
-	Subtracts `delta` from a numeric path.
-	@within Server
-	@method DecrementData
-	@param player Player
-	@param path Path<Data, number>
-	@param delta number? -- Defaults to `1`.
-	@return boolean
-]=]
-function Server.DecrementData(self: Self, player: Player, path: unknown, delta: number?): boolean
-	return self:IncrementData(player, path, -(delta or 1))
-end
-
---[=[
-	Deletes a profile path.
-	@within Server
-	@method RemoveData
-	@param player Player
-	@param path AnyPath<Data>
-	@return boolean
-]=]
-function Server.RemoveData(self: Self, player: Player, path: unknown): boolean
-	local keys, pathStr = Shared.resolvePath(path)
-	local data = self:GetData(player)
-	if not data then
-		return false
-	end
-
-	return self:_commitSet(player, data, keys, pathStr, nil)
-end
-
---[=[
-	Replaces an array item by index.
-	@within Server
-	@method UpdateArrayItem
-	@param player Player
-	@param path Path<Data, { V }> -- Path to the array.
-	@param index number
-	@param value V
-	@return boolean
-]=]
-function Server.UpdateArrayItem(self: Self, player: Player, path: unknown, index: number, value: unknown): boolean
-	local keys, pathStr = Shared.resolvePath(path)
-	local data = self:GetData(player)
-	if not data then
-		return false
-	end
-	if not checkSavable("UpdateArrayItem", pathStr, value) then
-		return false
-	end
-
-	if not self:_arrayWrite(player, data, keys, index, value, false) then
-		return false
-	end
-
-	self:_queueUpdate(player, Shared.OP.AUpd, keys, pathStr, index, value)
-	self:_emitUpdated(player, pathStr, value)
-	return true
-end
-
---[=[
-	Removes an array item by index.
-	@within Server
-	@method RemoveArrayItem
-	@param player Player
-	@param path Path<Data, { V }>
-	@param index number
-	@return boolean
-]=]
-function Server.RemoveArrayItem(self: Self, player: Player, path: unknown, index: number): boolean
-	local keys, pathStr = Shared.resolvePath(path)
-	local data = self:GetData(player)
-	if not data then
-		return false
-	end
-
-	if not self:_arrayWrite(player, data, keys, index, nil, true) then
-		return false
-	end
-
-	self:_queueUpdate(player, Shared.OP.ARm, keys, pathStr, index)
-	self:_emitUpdated(player, pathStr, nil)
-	return true
-end
-
---[=[
-	Applies several `Path.write` entries in one replication batch.
-	@within Server
-	@method BatchSetValues
-	@param player Player
-	@param writes { Write<Data> }
-	@return number -- How many paths changed.
-]=]
-function Server.BatchSetValues(self: Self, player: Player, writes: { Write<Table> }): number
-	local data = self:GetData(player)
-	if not data then
-		return 0
-	end
-
-	local changed = 0
-	for _, write in writes do
-		local keys, pathStr = Shared.resolvePath(write.path)
-		if write.value ~= nil and not checkSavable("BatchSetValues", pathStr, write.value) then
-			continue
-		end
-		if self:_commitSet(player, data, keys, pathStr, write.value) then
-			changed += 1
-		end
-	end
-	return changed
-end
-
---[=[
-	Edits a copy of the player's data and commits the changed paths all-or-nothing.
-	@within Server
-	@method Mutate
-	@param player Player
-	@param transform (draft: Data) -> ...boolean
-	@return boolean -- `true` if the draft was committed.
-]=]
-function Server.Mutate(self: Self, player: Player, transform: (draft: Table) -> ...boolean): boolean
-	assert(typeof(transform) == "function", "Mutate expects a transform function")
-	return self:MutateMany({ player }, function(drafts)
-		return transform(drafts[player])
+function Server.Update(self: Self, player: Player, transform: (data: Table) -> ...boolean?): boolean
+	assert(typeof(transform) == "function", "Update expects a transform function")
+	return self:UpdateMany({ player }, function(players)
+		return transform(players[player])
 	end)
 end
 
 --[=[
-	Like `Mutate`, for several loaded players at once.
+	Like `Update`, for several loaded players at once (atomic in memory, not across a crash).
 	@within Server
-	@method MutateMany
+	@method UpdateMany
 	@param players { Player }
-	@param transform (drafts: { [Player]: Data }) -> ...boolean
-	@return boolean -- `true` if every draft was committed.
+	@param transform (drafts: { [Player]: Data }) -> ...boolean?
+	@return boolean -- `true` if every draft committed.
 ]=]
-function Server.MutateMany(
+function Server.UpdateMany(
 	self: Self,
 	players: { Player },
-	transform: (drafts: { [Player]: Table }) -> ...boolean
+	transform: (drafts: { [Player]: Table }) -> ...boolean?
 ): boolean
-	assert(typeof(players) == "table" and #players > 0, "MutateMany expects a non-empty player list")
-	assert(typeof(transform) == "function", "MutateMany expects a transform function")
+	assert(typeof(players) == "table" and #players > 0, "UpdateMany expects a non-empty player list")
+	assert(typeof(transform) == "function", "UpdateMany expects a transform function")
+	if self._isUpdating then
+		error("EZProfileStore: Update cannot run inside another Update; use UpdateMany", 2)
+	end
 
-	local originals: { [Player]: Table } = {}
-	local drafts: { [Player]: Table } = {}
+	local proxies: { [Player]: Table } = {}
+	local draftsByPlayer: { [Player]: Draft } = {}
 	for _, player in players do
-		assert(drafts[player] == nil, "MutateMany players must be unique")
-		local data = self:GetData(player)
+		assert(proxies[player] == nil, "UpdateMany players must be unique")
+		local data = self:Get(player)
 		if not data then
 			return false
 		end
-		originals[player] = data
-		drafts[player] = Shared.deepCopy(data)
+		proxies[player], draftsByPlayer[player] = newDraft(data)
 	end
 
-	local failure = runTransform(transform, drafts)
+	self._isUpdating = true
+	local failure = runTransform(transform, proxies)
+	self._isUpdating = false
+	for _, proxy in proxies do
+		drafts[proxy] = nil
+	end
 	if failure ~= nil then
 		if failure ~= "" then
-			warn(`EZProfileStore: Mutate {failure}; changes were discarded`)
+			warn(`EZProfileStore: Update {failure}; nothing changed`)
 		end
 		return false
 	end
 
 	local changesByPlayer: { [Player]: { Shared.Change } } = {}
 	for _, player in players do
-		local draft = Shared.asTable(drafts[player])
-		if draft == nil then
-			warn("EZProfileStore: Mutate drafts must remain tables")
-			return false
-		end
-
-		local changes, invalidKey = Shared.diff(originals[player], draft)
-		if changes == nil then
-			warn(`EZProfileStore: Mutate rejected key {tostring(invalidKey)}; keys must be strings without "."`)
-			return false
-		end
-		for _, change in changes do
-			if change.value ~= nil and not checkSavable("Mutate", change.key, change.value) then
-				return false
-			end
-		end
-
-		if #changes > 0 then
-			local valid, reason = runValidator(self._validate, draft)
+		local draft = draftsByPlayer[player]
+		if isTouched(draft) then
+			local valid, validateReason = runValidator(self._validate, draftView(draft))
 			if not valid then
-				warn(`EZProfileStore: Mutate rejected by validate: {reason}`)
+				warn(`EZProfileStore: Update rejected by validate: {validateReason}`)
 				return false
 			end
+		end
+		local changes, reason = collectChanges(draft)
+		if changes == nil then
+			warn(`EZProfileStore: Update rejected {reason}`)
+			return false
 		end
 		changesByPlayer[player] = changes
 	end
 
-	local committed: { { player: Player, change: Shared.Change } } = {}
 	for _, player in players do
-		local data = originals[player]
-		for _, change in changesByPlayer[player] do
-			if self:_applySet(player, data, change.path, change.key, change.value) then
-				table.insert(committed, { player = player, change = change })
+		local changes = changesByPlayer[player]
+		if #changes > 0 then
+			commitDraft(draftsByPlayer[player], changes)
+			for _, change in changes do
+				self:_queueUpdate(player, change)
+			end
+			if self._leaderstats[player] then
+				self._dirtyLeaderstats[player] = true
+				self:_scheduleFlush()
 			end
 		end
 	end
-
-	for _, entry in committed do
-		self:_emitUpdated(entry.player, entry.change.key, entry.change.value)
-	end
-	return true
-end
-
---[=[
-	Makes the mutations inside `transform` all-or-nothing; replication waits until commit.
-	@within Server
-	@method Transaction
-	@param transform () -> ...boolean
-	@return boolean -- `true` if the writes were committed.
-]=]
-function Server.Transaction(self: Self, transform: () -> ...boolean): boolean
-	assert(typeof(transform) == "function", "Transaction expects a transform function")
-
-	local outer = self._transaction
-	local transaction: TransactionState = outer or { undo = {}, updates = {}, events = {}, players = {} }
-	local undoMark, updateMark, eventMark = #transaction.undo, #transaction.updates, #transaction.events
-	self._transaction = transaction
-
-	local failure = runTransform(transform)
-	if failure == nil and outer == nil then
-		failure = self:_validatePlayers(transaction.players)
-	end
-
-	if failure ~= nil then
-		for i = #transaction.undo, undoMark + 1, -1 do
-			transaction.undo[i]()
+	for _, player in players do
+		if #changesByPlayer[player] > 0 then
+			self.Changed:Fire(player, draftsByPlayer[player].live)
 		end
-		truncate(transaction.undo, undoMark)
-		truncate(transaction.updates, updateMark)
-		truncate(transaction.events, eventMark)
-		self._transaction = outer
-		if failure ~= "" then
-			warn(`EZProfileStore: Transaction {failure}; changes were rolled back`)
-		end
-		return false
-	elseif outer ~= nil then
-		return true
-	end
-
-	self._transaction = nil
-	for _, update in transaction.updates do
-		self:_appendToBatch(update.player, update.opcode, update.pathStr, update.valueOrIndex, update.value)
-	end
-	for _, event in transaction.events do
-		self.DataUpdated:Fire(event.player, event.pathStr, event.value)
 	end
 	return true
 end
@@ -1872,7 +1559,7 @@ function Server.Destroy(self: Self)
 	self.ProfileLoaded:Destroy()
 	self.ProfileReleased:Destroy()
 	self.FirstJoin:Destroy()
-	self.DataUpdated:Destroy()
+	self.Changed:Destroy()
 	self.PreSave:Destroy()
 	self.PostSave:Destroy()
 	self.LastSave:Destroy()

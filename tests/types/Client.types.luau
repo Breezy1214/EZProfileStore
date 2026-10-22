@@ -10,41 +10,43 @@ export type Data = {
 	Pets: { [string]: { Level: number } },
 }
 local template: Data = { Coins = 0, Stats = { Wins = 0 }, Inventory = {}, Pets = {} }
-local Paths = EZProfileStore.Path.tree(template)
 
 local client = EZProfileStore.Client.new({ template = template })
 
-local _coins: number? = client:Read(Paths.Coins)
-local _level: number? = client:Read(Paths.Pets["a"].Level)
-local _bad: string? = client:Read(Paths.Coins) -- expect-error
-
-client:OnChanged(Paths.Stats.Wins, function(newValue: number?, oldValue: number?)
-	local _delta: number = (newValue or 0) - (oldValue or 0)
+local wins = client:Select(function(data)
+	return data.Stats.Wins
 end)
-client:WatchPath(Paths.Stats.Wins):onChange(function(newValue, oldValue)
-	local _delta: number = (newValue or 0) - (oldValue or 0)
+local _wins: number? = wins:Get()
+local _badWins: string? = wins:Get() -- expect-error
+wins:Observe(function(new, old)
+	local _delta: number = (new or 0) - (old or 0)
 end)
-client:OnChanged(Paths.Stats.Wins, function(_newValue: string?) end) -- expect-error
+wins:Observe(function(_new: string?) end) -- expect-error
+wins:Destroy()
 
-local watcher = client:WatchPath(Paths.Inventory)
-local _items: { string }? = watcher.get()
-watcher:Destroy()
+local total = client:Select(function(data)
+	return data.Coins + data.Stats.Wins
+end)
+local _state = total.State
+total:Destroy()
+
+client:Select(function(data)
+	data.Coins = 1 -- expect-error
+	return data.Coins
+end)
 
 client.Ready:andThen(function(data)
 	local _total: number = data.Coins + data.Stats.Wins
 	data.Coins = 1 -- expect-error
 end)
 
-local data = client:GetDataAsync()
-local _wins: number = data.Stats.Wins
+local data = client:GetAsync()
+local _items: { string } = data.Inventory
 data.Stats.Wins = 2 -- expect-error
 
--- Annotating instead of passing a template also works.
 local annotated = EZProfileStore.Client.new() :: EZProfileStore.Client<Data>
-local _annotatedCoins: number? = annotated:Read(Paths.Coins)
-
-local function award(store: EZProfileStore.Server<Data>, player: Player)
-	store:IncrementData(player, Paths.Coins, 5)
-	store:IncrementData(player, Paths.Inventory, 5) -- expect-error
-end
-local _ = award
+local _annotatedCoins = annotated
+	:Select(function(snapshot)
+		return snapshot.Coins
+	end)
+	:Get()
