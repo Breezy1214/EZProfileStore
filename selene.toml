@@ -1,4 +1,4 @@
-std = "roblox+testez"
+std = "roblox+testez+luau_type_functions"
 
 [config]
 shadowing = { ignore_pattern = "_" }
