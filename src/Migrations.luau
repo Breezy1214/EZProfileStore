@@ -8,6 +8,8 @@
 
 local Shared = require(script.Parent.Shared)
 
+export type RawData = Shared.Table
+
 export type ContextInput = {
 	key: string?,
 	userId: number?,
@@ -19,7 +21,7 @@ export type Context = {
 	name: string,
 	direction: "up" | "down",
 }
-export type MigrationFunction = (data: { [any]: any }, context: Context) -> { [any]: any }?
+export type MigrationFunction = (data: RawData, context: Context) -> RawData?
 export type Definition = {
 	name: string?,
 	up: MigrationFunction,
@@ -44,17 +46,17 @@ type ResolvedDefinition = {
 	down: MigrationFunction?,
 }
 
+local Migrations = {}
+Migrations.__index = Migrations
+
 export type Migrations = typeof(setmetatable(
 	{} :: {
 		_definitions: { ResolvedDefinition },
 	},
-	{} :: { __index: any }
+	Migrations
 ))
 
-local Migrations = {}
-Migrations.__index = Migrations
-
-local function replaceTable(target: { [any]: any }, source: { [any]: any })
+local function replaceTable(target: RawData, source: RawData)
 	table.clear(target)
 	for key, value in source do
 		target[key] = value
@@ -101,7 +103,7 @@ local function migrationContext(base: ContextInput?, definition: ResolvedDefinit
 end
 
 local function runMigration(
-	data: { [any]: any },
+	data: RawData,
 	definition: ResolvedDefinition,
 	direction: "up" | "down",
 	context: ContextInput?
@@ -118,14 +120,15 @@ local function runMigration(
 	end
 
 	if replacement ~= nil and replacement ~= data then
-		assert(typeof(replacement) == "table", `migration {definition.version} returned a non-table value`)
-		replaceTable(data, replacement)
+		local replacementTable = Shared.asTable(replacement)
+		assert(replacementTable ~= nil, `migration {definition.version} returned a non-table value`)
+		replaceTable(data, replacementTable)
 	end
 end
 
 local function runTransaction(
 	self: Migrations,
-	data: { [any]: any },
+	data: RawData,
 	firstVersion: number,
 	lastVersion: number,
 	step: number,
@@ -160,9 +163,9 @@ end
 	@return Migrations
 ]=]
 function Migrations.new(definitions: { Input }?): Migrations
-	local self = setmetatable({
+	local self: Migrations = setmetatable({
 		_definitions = {},
-	}, Migrations) :: any
+	}, Migrations)
 
 	local initial: { Input } = definitions or ({} :: { Input })
 	for _, definition in initial do
@@ -191,11 +194,12 @@ function Migrations.Add(
 	local input: Input
 	if typeof(definition) == "string" then
 		assert(typeof(up) == "function", "Migrations:Add(name, up) requires an up function")
-		input = {
+		local named: Definition = {
 			name = definition,
 			up = up,
 			down = down,
 		}
+		input = named
 	else
 		assert(up == nil and down == nil, "up/down arguments are only valid with a migration name")
 		input = definition
@@ -219,17 +223,12 @@ end
 	Runs migrations after `fromVersion`; restores `data` on failure.
 	@within Migrations
 	@method Migrate
-	@param data { [any]: any }
+	@param data RawData
 	@param fromVersion number?
 	@param context ContextInput?
 	@return Report
 ]=]
-function Migrations.Migrate(
-	self: Migrations,
-	data: { [any]: any },
-	fromVersion: number?,
-	context: ContextInput?
-): Report
+function Migrations.Migrate(self: Migrations, data: RawData, fromVersion: number?, context: ContextInput?): Report
 	assert(typeof(data) == "table", "Migrations:Migrate data must be a table")
 	local current = fromVersion or 0
 	local latestVersion = self:GetLatestVersion()
@@ -257,7 +256,7 @@ end
 	Runs `down` migrations to `targetVersion`; restores `data` on failure.
 	@within Migrations
 	@method Rollback
-	@param data { [any]: any }
+	@param data RawData
 	@param fromVersion number
 	@param targetVersion number?
 	@param context ContextInput?
@@ -265,7 +264,7 @@ end
 ]=]
 function Migrations.Rollback(
 	self: Migrations,
-	data: { [any]: any },
+	data: RawData,
 	fromVersion: number,
 	targetVersion: number?,
 	context: ContextInput?

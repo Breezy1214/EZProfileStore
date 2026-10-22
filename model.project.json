@@ -1,0 +1,29 @@
+{
+	"name": "EZProfileStore",
+	"tree": {
+		"$className": "DataModel",
+		"ReplicatedStorage": {
+			"EZProfileStore": {
+				"$path": "bundle",
+				"Packages": {
+					"$className": "Folder",
+					"EZProfileStore": {
+						"$path": "src"
+					},
+					"Fusion": {
+						"$path": "Packages/_Index/elttob_fusion@0.3.0/fusion"
+					},
+					"Promise": {
+						"$path": "Packages/_Index/evaera_promise@4.0.0/promise"
+					},
+					"Signal": {
+						"$path": "Packages/_Index/sleitnick_signal@2.0.3/signal"
+					},
+					"ProfileStore": {
+						"$path": "ServerPackages/_Index/lm-loleris_profilestore@1.0.3/profilestore"
+					}
+				}
+			}
+		}
+	}
+}

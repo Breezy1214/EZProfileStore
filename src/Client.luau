@@ -11,64 +11,80 @@
 	@within Client
 	.remoteParent Instance? -- Parent of the replication folder. Defaults to `ReplicatedStorage`.
 	.waitTimeout number? -- Seconds to wait for the replication remotes. Defaults to `30`.
+	.template Data? -- Your shared template. Only used to infer `Data`; never read at runtime.
 ]=]
 
 --[=[
-	@prop Ready Promise<{ [any]: any }>
+	@prop Ready Ready<ReadOnly<Data>>
 	@within Client
 	Resolves with the initial snapshot.
-]=]
-
---[=[
-	@prop Updated Signal<{ string }, any>
-	@within Client
-	Fires for each replicated path update.
 ]=]
 
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local RunService = game:GetService("RunService")
 
 local Fusion = require(script.Parent.Parent.Fusion)
-local PathWatcher = require(script.Parent.Parent.PathWatcher)
-local Promise = require(script.Parent.Parent.Promise)
 local Shared = require(script.Parent.Shared)
-local Signal = require(script.Parent.Parent.Signal)
+local Types = require(script.Parent.Types)
+local Promise = (require(script.Parent.Parent.Promise) :: unknown) :: Types.PromiseLibrary
 
 local DEFAULT_WAIT_TIMEOUT = 30
 local MAX_PENDING_ENTRIES = 1024
 
-export type Config = {
-	remoteParent: Instance?,
-	waitTimeout: number?,
-}
+type Table = Shared.Table
 
-export type Disconnect = () -> ()
+export type Config<Data> = Types.ClientConfig<Data>
+export type Disconnect = Types.Disconnect
+export type Ready<T> = Types.Ready<T>
+export type Selection<V> = Types.Selection<V>
+export type Client<Data> = Types.Client<Data>
+
 type PendingBatch = {
 	seq: number,
-	batch: Shared.Batch,
+	batch: { unknown },
 }
-export type PathWatcher = PathWatcher.PathWatcher
 
-export type Client = typeof(setmetatable(
+local Client = {}
+Client.__index = Client
+
+local Selection = {}
+Selection.__index = Selection
+
+type SelectionImpl = typeof(setmetatable(
 	{} :: {
-		_dataValue: Fusion.Value<{ [any]: any }?>,
+		State: Fusion.Computed<unknown>,
+		_scope: Fusion.Scope<typeof(Fusion)>,
+	},
+	Selection
+))
+
+local function deepFreeze<T>(value: T): T
+	local tbl = Shared.asTable(value)
+	if tbl ~= nil and not table.isfrozen(tbl) then
+		for _, child in tbl do
+			deepFreeze(child)
+		end
+		table.freeze(tbl)
+	end
+	return value
+end
+
+type Self = typeof(setmetatable(
+	{} :: {
+		_dataValue: Fusion.Value<Table?>,
 		_seq: number,
 		_pendingBatches: { PendingBatch },
 		_pendingEntryCount: number,
 		_overflowWarned: boolean,
 		_connections: { RBXScriptConnection },
-		_scope: any,
-		_resolveReady: (data: { [any]: any }) -> (),
-		_rejectReady: (reason: any) -> (),
+		_scope: Fusion.Scope<typeof(Fusion)>?,
+		_resolveReady: (data: Table) -> (),
+		_rejectReady: (reason: unknown) -> (),
 		_isDestroyed: boolean,
-		Ready: any,
-		Updated: Signal.Signal<{ string }, any>,
+		Ready: Types.Promise,
 	},
-	{} :: { __index: any }
+	Client
 ))
-
-local Client = {}
-Client.__index = Client
 
 local function waitForChild(parent: Instance, name: string, className: string, timeout: number): Instance
 	local instance = parent:WaitForChild(name, timeout)
@@ -83,15 +99,9 @@ local function waitForChild(parent: Instance, name: string, className: string, t
 	return instance
 end
 
---[=[
-	Creates the local profile mirror.
-	@within Client
-	@param config Config?
-	@return Client
-]=]
-function Client.new(config: Config?): Client
+local function construct(config: Config<Table>?): Self
 	assert(RunService:IsClient(), "EZProfileStore.Client can only be required on the client")
-	local resolved: Config = config or {}
+	local resolved: Config<Table> = config or {}
 	local timeout = resolved.waitTimeout or DEFAULT_WAIT_TIMEOUT
 
 	local remoteParent = resolved.remoteParent or ReplicatedStorage
@@ -101,14 +111,16 @@ function Client.new(config: Config?): Client
 
 	local scope = Fusion.scoped(Fusion)
 
-	local resolveReady, rejectReady
+	local resolveReady: (data: Table) -> () = function() end
+	local rejectReady: (reason: unknown) -> () = function() end
 	local readyPromise = Promise.new(function(resolve, reject)
 		resolveReady = resolve
 		rejectReady = reject
 	end)
 
-	local self = setmetatable({
-		_dataValue = scope:Value(nil),
+	local dataValue: Fusion.Value<Table?> = scope:Value(nil :: Table?)
+	local self: Self = setmetatable({
+		_dataValue = dataValue,
 		_seq = 0,
 		_pendingBatches = {},
 		_pendingEntryCount = 0,
@@ -119,12 +131,11 @@ function Client.new(config: Config?): Client
 		_rejectReady = rejectReady,
 		_isDestroyed = false,
 		Ready = readyPromise,
-		Updated = Signal.new(),
-	}, Client) :: any
+	}, Client)
 
 	table.insert(
 		self._connections,
-		dataUpdate.OnClientEvent:Connect(function(seq, batch)
+		dataUpdate.OnClientEvent:Connect(function(seq: unknown, batch: unknown)
 			self:_handleUpdate(seq, batch)
 		end)
 	)
@@ -134,12 +145,12 @@ function Client.new(config: Config?): Client
 			return
 		end
 
-		local ok, snapshot = pcall(function()
+		local ok, response = pcall(function(): unknown
 			return requestData:InvokeServer()
 		end)
 
 		if not ok then
-			local reason = `EZProfileStore.Client: snapshot request failed: {snapshot}`
+			local reason = `EZProfileStore.Client: snapshot request failed: {response}`
 			warn(reason)
 			self:_rejectInit(reason)
 			return
@@ -149,22 +160,36 @@ function Client.new(config: Config?): Client
 			return
 		end
 
-		if typeof(snapshot) ~= "table" or typeof(snapshot.seq) ~= "number" or typeof(snapshot.data) ~= "table" then
+		local snapshot = Shared.asTable(response)
+		local seq = if snapshot then snapshot.seq else nil
+		local data = if snapshot then Shared.asTable(snapshot.data) else nil
+		if typeof(seq) ~= "number" or data == nil then
 			self:_rejectInit("EZProfileStore.Client: snapshot request returned no data")
 			return
 		end
 
-		self:_handleInit(snapshot)
+		self:_handleInit({ seq = seq, data = data })
 	end)
 
 	return self
 end
 
-function Client._isInitialized(self: Client): boolean
+--[=[
+	Creates the local profile mirror. Pass `template` to type it.
+	@within Client
+	@param config Config<Data>?
+	@return Client<Data>
+]=]
+function Client.new<Data>(config: Config<Data>?): Client<Data>
+	local self = construct((config :: unknown) :: Config<Table>?)
+	return (self :: unknown) :: Client<Data>
+end
+
+function Client._isInitialized(self: Self): boolean
 	return Fusion.peek(self._dataValue) ~= nil
 end
 
-function Client._rejectInit(self: Client, reason: any)
+function Client._rejectInit(self: Self, reason: unknown)
 	if self._isDestroyed or self:_isInitialized() then
 		return
 	end
@@ -172,12 +197,12 @@ function Client._rejectInit(self: Client, reason: any)
 	self._rejectReady(reason)
 end
 
-function Client._handleInit(self: Client, snapshot: Shared.Snapshot)
+function Client._handleInit(self: Self, snapshot: Shared.Snapshot)
 	if self._isDestroyed or self:_isInitialized() then
 		return
 	end
 
-	self._dataValue:set(snapshot.data)
+	self._dataValue:set(deepFreeze(snapshot.data))
 	self._seq = snapshot.seq
 
 	local pending = self._pendingBatches
@@ -187,15 +212,16 @@ function Client._handleInit(self: Client, snapshot: Shared.Snapshot)
 		-- Batches at or below the snapshot sequence are already contained in it.
 		if entry.seq > self._seq then
 			self._seq = entry.seq
-			self:_applyBatch(entry.batch, false)
+			self:_applyBatch(entry.batch)
 		end
 	end
 
-	self._resolveReady(Fusion.peek(self._dataValue))
+	self._resolveReady(Fusion.peek(self._dataValue) or snapshot.data)
 end
 
-function Client._handleUpdate(self: Client, seq: number, batch: Shared.Batch)
-	if self._isDestroyed or typeof(seq) ~= "number" or typeof(batch) ~= "table" then
+function Client._handleUpdate(self: Self, seq: unknown, payload: unknown)
+	local batch = Shared.asArray(payload)
+	if self._isDestroyed or typeof(seq) ~= "number" or batch == nil then
 		return
 	end
 
@@ -219,118 +245,151 @@ function Client._handleUpdate(self: Client, seq: number, batch: Shared.Batch)
 		return
 	end
 	self._seq = seq
-	self:_applyBatch(batch, true)
+	self:_applyBatch(batch)
 end
 
-function Client._applyBatch(self: Client, batch: Shared.Batch, fireSignal: boolean)
-	local current = Fusion.peek(self._dataValue)
-	if current == nil then
+-- Copy-on-write per batch: each table on a changed path is cloned once, written in place, and
+-- frozen at the end, so untouched subtrees keep their identity for selections.
+function Client._applyBatch(self: Self, batch: { unknown })
+	local root = Fusion.peek(self._dataValue)
+	if root == nil then
 		return
 	end
 
-	local newData: any = current
-	local toFire: { any }? = if fireSignal then table.create(#batch * 2) else nil
+	local owned: { [Table]: true } = {}
+	local function own(tbl: Table): Table
+		if owned[tbl] then
+			return tbl
+		end
+		local copy = table.clone(tbl)
+		owned[copy] = true
+		return copy
+	end
 
-	for _, entry in batch do
-		local opcode = entry[1]
-		local pathStr = entry[2]
-		if typeof(opcode) ~= "string" or typeof(pathStr) ~= "string" then
+	local received: { unknown } = {}
+	for _, item in batch do
+		local entry = Shared.asArray(item)
+		local opcode = if entry then entry[1] else nil
+		local pathStr = if entry then entry[2] else nil
+		if
+			typeof(pathStr) ~= "string"
+			or (opcode ~= Shared.OP.Set and opcode ~= Shared.OP.Del and opcode ~= Shared.OP.Ins)
+		then
+			continue
+		end
+		local path = Shared.splitKey(pathStr)
+		local value = if opcode == Shared.OP.Del then nil else (entry :: { unknown })[3]
+		local isInsert = opcode == Shared.OP.Ins
+		local existing = Shared.readPath(root, path)
+		if #path == 0 or (isInsert and Shared.asTable(existing) == nil) or (value == nil and existing == nil) then
 			continue
 		end
 
-		local path = Shared.resolveKeyPath(pathStr)
-		if #path == 0 then
-			continue
+		root = own(root :: Table)
+		local target = root :: Table
+		for i = 1, #path - 1 do
+			local current = Shared.asTable(target[path[i]])
+			local nextTarget = if current then own(current) else {}
+			owned[nextTarget] = true
+			target[path[i]] = nextTarget
+			target = nextTarget
 		end
-
-		local fireValue: any = nil
-		if opcode == Shared.OP.Set then
-			newData = Shared.writePathSpine(newData, path, entry[3], false)
-			fireValue = entry[3]
-		elseif opcode == Shared.OP.Del then
-			newData = Shared.writePathSpine(newData, path, nil, false)
-			fireValue = nil
-		elseif opcode == Shared.OP.Ins then
-			newData = Shared.writePathSpine(newData, path, entry[3], true)
-			fireValue = entry[3]
-		elseif opcode == Shared.OP.AUpd then
-			newData = Shared.arrayUpdateSpine(newData, path, entry[3], entry[4])
-			fireValue = entry[4]
-		elseif opcode == Shared.OP.ARm then
-			newData = Shared.arrayRemoveSpine(newData, path, entry[3])
-			fireValue = nil
+		local finalKey = path[#path]
+		if isInsert then
+			local array = own(existing :: Table)
+			array[#array + 1] = value
+			target[finalKey] = array
 		else
-			continue
+			target[finalKey] = value
 		end
-
-		if toFire then
-			table.insert(toFire, path)
-			table.insert(toFire, fireValue)
+		if typeof(value) == "table" then
+			table.insert(received, value)
 		end
 	end
 
-	self._dataValue:set(newData)
-
-	if toFire then
-		for i = 1, #toFire, 2 do
-			self.Updated:Fire(toFire[i], toFire[i + 1])
-		end
+	for _, value in received do
+		deepFreeze(value)
 	end
+	for tbl in owned do
+		table.freeze(tbl)
+	end
+	self._dataValue:set(root)
+end
+
+-- A promise that follows `Ready`; cancelling or timing it out leaves the shared `Ready` untouched.
+local function followReady(self: Self): Types.Promise
+	return Promise.new(function(resolve, reject)
+		self.Ready:andThen(resolve, reject)
+	end)
 end
 
 --[=[
 	Returns the read-only snapshot, if loaded.
 	@within Client
-	@method GetData
-	@return { [any]: any }?
+	@method Get
+	@return ReadOnly<Data>?
 ]=]
-function Client.GetData(self: Client): { [any]: any }?
+function Client.Get(self: Self): Table?
 	return Fusion.peek(self._dataValue)
-end
-
---[=[
-	Returns the snapshot's `Fusion.Value`.
-	@within Client
-	@method GetDataState
-	@return Fusion.Value<{ [any]: any }?>
-]=]
-function Client.GetDataState(self: Client)
-	return self._dataValue
 end
 
 --[=[
 	Yields for the initial snapshot. Errors if it fails to load or `timeout` elapses.
 	@within Client
-	@method GetDataAsync
+	@method GetAsync
 	@yields
 	@param timeout number? -- Waits until `Ready` settles by default.
-	@return { [any]: any }
+	@return ReadOnly<Data>
 ]=]
-function Client.GetDataAsync(self: Client, timeout: number?): { [any]: any }
-	if timeout == nil then
-		return self.Ready:expect()
-	end
-
-	return Promise.new(function(resolve, reject)
-		self.Ready:andThen(resolve, reject)
-	end)
-		:timeout(timeout)
-		:expect()
+function Client.GetAsync(self: Self, timeout: number?): Table
+	local promise = if timeout == nil then self.Ready else followReady(self):timeout(timeout)
+	return promise:expect() :: Table
 end
 
 --[=[
-	Reads a path from the snapshot.
+	Returns a live view of part of the data, e.g. `client:Select(function(data) return data.Coins end)`.
 	@within Client
-	@method Read
-	@param keyPath KeyPath -- Dot-notation string or array of segments.
-	@return any
+	@method Select
+	@param selector (data: ReadOnly<Data>) -> V
+	@return Selection<V>
 ]=]
-function Client.Read(self: Client, keyPath: Shared.KeyPath): any
-	local current = Fusion.peek(self._dataValue)
-	if current == nil then
-		return nil
+function Client.Select(self: Self, selector: (data: Table) -> unknown): SelectionImpl
+	assert(typeof(selector) == "function", "Select expects a selector function")
+	local scope = self._scope
+	assert(scope ~= nil, "EZProfileStore.Client was destroyed")
+
+	local inner = scope:innerScope()
+	local dataValue = self._dataValue
+	local state = inner:Computed(function(use): unknown
+		local data = use(dataValue)
+		return if data == nil then nil else selector(data)
+	end)
+	return setmetatable({ State = state, _scope = inner }, Selection)
+end
+
+function Selection.Get(self: SelectionImpl): unknown
+	return Fusion.peek(self.State)
+end
+
+function Selection.Observe(self: SelectionImpl, callback: (new: unknown, old: unknown) -> ()): Disconnect
+	local previous = Fusion.peek(self.State)
+	local observerScope = self._scope:innerScope()
+	observerScope:Observer(self.State):onChange(function()
+		local current = Fusion.peek(self.State)
+		if current == previous then
+			return
+		end
+		local old = previous
+		previous = current
+		callback(current, old)
+	end)
+	return function()
+		observerScope:doCleanup()
 	end
-	return Shared.readPath(current, Shared.resolveKeyPath(keyPath))
+end
+
+function Selection.Destroy(self: SelectionImpl)
+	self._scope:doCleanup()
 end
 
 --[=[
@@ -339,7 +398,7 @@ end
 	@method IsReady
 	@return boolean
 ]=]
-function Client.IsReady(self: Client): boolean
+function Client.IsReady(self: Self): boolean
 	return self.Ready:getStatus() == Promise.Status.Resolved
 end
 
@@ -347,13 +406,13 @@ end
 	Calls `callback` once when the snapshot is ready.
 	@within Client
 	@method OnReady
-	@param callback (data: { [any]: any }) -> ()
+	@param callback (data: ReadOnly<Data>) -> ()
 	@return Disconnect
 ]=]
-function Client.OnReady(self: Client, callback: (data: { [any]: any }) -> ()): Disconnect
-	local chain = Promise.new(function(resolve, reject)
-		self.Ready:andThen(resolve, reject)
-	end):andThen(callback)
+function Client.OnReady(self: Self, callback: (data: Table) -> ()): Disconnect
+	local chain = followReady(self):andThen(function(data: unknown)
+		callback(data :: Table)
+	end)
 
 	return function()
 		chain:cancel()
@@ -361,42 +420,11 @@ function Client.OnReady(self: Client, callback: (data: { [any]: any }) -> ()): D
 end
 
 --[=[
-	Creates a caller-owned watcher for `keyPath`; destroy it after use.
-	@within Client
-	@method WatchPath
-	@param keyPath KeyPath
-	@return PathWatcher
-]=]
-function Client.WatchPath(self: Client, keyPath: Shared.KeyPath): PathWatcher
-	return PathWatcher.new(self._dataValue :: any, keyPath)
-end
-
---[=[
-	Subscribes to a path and returns a disconnect function.
-	@within Client
-	@method OnChanged
-	@param keyPath KeyPath
-	@param callback (newValue: any, oldValue: any) -> ()
-	@return Disconnect
-]=]
-function Client.OnChanged(
-	self: Client,
-	keyPath: Shared.KeyPath,
-	callback: (newValue: any, oldValue: any) -> ()
-): Disconnect
-	local watcher = self:WatchPath(keyPath)
-	watcher:onChange(callback)
-	return function()
-		watcher:Destroy()
-	end
-end
-
---[=[
-	Disconnects listeners, releases state, and rejects unresolved `Ready`.
+	Disconnects listeners, releases state and selections, and rejects unresolved `Ready`.
 	@within Client
 	@method Destroy
 ]=]
-function Client.Destroy(self: Client)
+function Client.Destroy(self: Self)
 	if self._isDestroyed then
 		return
 	end
@@ -409,11 +437,11 @@ function Client.Destroy(self: Client)
 	end
 
 	table.clear(self._connections)
-	if self._scope then
-		self._scope:doCleanup()
+	local scope = self._scope
+	if scope then
+		scope:doCleanup()
 		self._scope = nil
 	end
-	self.Updated:Destroy()
 end
 
 return Client

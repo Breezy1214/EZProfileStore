@@ -1,0 +1,4 @@
+# `types` is the library available inside Luau `type function` bodies.
+globals:
+  types:
+    any: true
