@@ -78,17 +78,27 @@ return function()
 	describe("Client sequencing", function()
 		it("drops buffered batches already contained in the snapshot", function()
 			local c = makeClient(nil)
-			c._resolveReady = function() end
+			local resolved = nil
+			c._resolveReady = function(data)
+				resolved = data
+			end
 
 			c:_handleUpdate(1, { { Shared.OP.Ins, "Items", "Sword" } })
 			c:_handleUpdate(2, { { Shared.OP.Ins, "Items", "Shield" } })
 			c:_handleInit({ seq = 1, data = { Items = { "Sword" } } })
 
 			local items = Fusion.peek(c._dataValue).Items
+			expect(resolved).to.equal(Fusion.peek(c._dataValue))
 			expect(#items).to.equal(2)
 			expect(items[1]).to.equal("Sword")
 			expect(items[2]).to.equal("Shield")
 			expect(c._seq).to.equal(2)
+		end)
+
+		it("skips malformed entries without dropping the rest of the batch", function()
+			local c = makeClient({ Coins = 0 })
+			c:_handleUpdate(1, { "junk", 5, { Shared.OP.Set, "Coins", 7 } })
+			expect(Fusion.peek(c._dataValue).Coins).to.equal(7)
 		end)
 
 		it("ignores stale batches after initialization", function()

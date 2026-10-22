@@ -10,31 +10,31 @@
 	@interface Config
 	@within Server
 	.storeName string -- ProfileStore name.
-	.template { [any]: any } -- Current data template.
+	.template Data -- Current data template; its type becomes `Data`.
 	.keyPrefix string? -- Defaults to `"Player_"`.
 	.mode "live" | "studio" | "mock"? -- Defaults to `"live"`.
-	.useMockInStudio boolean? -- Alias for `mode = "studio"`.
-	.store any? -- Injected store for tests.
-	.profileStore any? -- Injected ProfileStore module.
+	.store ProfileStore<Data>? -- Injected store for tests.
+	.profileStore ProfileStoreModule? -- Injected ProfileStore module.
 	.migrations Migrations | { MigrationInput }? -- Ordered migrations.
 	.migrateNewProfiles boolean? -- Defaults to `false`.
 	.migrationMetadataKey string? -- Defaults to `"EZProfileStoreVersion"`.
 	.remoteParent Instance? -- Defaults to `ReplicatedStorage`.
-	.leaderstats { LeaderstatEntry }? -- Mirrored profile paths.
-	.privatePaths { KeyPath }? -- Server-only paths that never replicate.
-	.validate ((data: { [any]: any }) -> (boolean, string?))? -- Checked on load and by `Mutate`.
+	.autoLoadPlayers boolean? -- Start sessions for joining players. Defaults to `true`; set `false` in unit tests.
+	.leaderstats { LeaderstatEntry<Data> }? -- Mirrored profile paths.
+	.privatePaths { AnyPath<Data> }? -- Server-only paths that never replicate.
+	.validate ((data: Data) -> (boolean, string?))? -- Checked on load and by `Mutate`.
 ]=]
 
 --[=[
 	@interface LeaderstatEntry
 	@within Server
-	.path KeyPath
+	.path Path<Data, number> | Path<Data, string>
 	.name string
 	.type "IntValue" | "NumberValue" | "StringValue"
 ]=]
 
 --[=[
-	@prop ProfileLoaded Signal<Player, Profile>
+	@prop ProfileLoaded Signal<Player, Profile<Data>>
 	@within Server
 	Fires when a profile is ready.
 ]=]
@@ -46,25 +46,25 @@
 ]=]
 
 --[=[
-	@prop FirstJoin Signal<Player, { [any]: any }>
+	@prop FirstJoin Signal<Player, Data>
 	@within Server
 	Fires on the first profile session.
 ]=]
 
 --[=[
-	@prop DataUpdated Signal<Player, KeyPath, any>
+	@prop DataUpdated Signal<Player, string, unknown>
 	@within Server
-	Fires after a replicated mutation.
+	Fires after a replicated mutation with the dot-joined path (compare with `Path.keyOf(path)`) and new value.
 ]=]
 
 --[=[
-	@prop PreSave Signal<Player, { [any]: any }>
+	@prop PreSave Signal<Player, Data>
 	@within Server
 	Forwards `Profile.OnSave`.
 ]=]
 
 --[=[
-	@prop PostSave Signal<Player, { [any]: any }>
+	@prop PostSave Signal<Player, Data>
 	@within Server
 	Forwards `Profile.OnAfterSave`.
 ]=]
@@ -88,7 +88,7 @@
 ]=]
 
 --[=[
-	@type MessageHandler (player: Player, message: { [any]: any }, processed: () -> ()) -> ()
+	@type MessageHandler (player: Player, message: Table, processed: () -> ()) -> ()
 	@within Server
 	Call `processed` once the message is applied; unprocessed messages are redelivered next session.
 ]=]
@@ -104,79 +104,84 @@ local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local RunService = game:GetService("RunService")
 
 local Migrations = require(script.Parent.Migrations)
-local Promise = require(script.Parent.Parent.Promise)
 local Shared = require(script.Parent.Shared)
 local Signal = require(script.Parent.Parent.Signal)
+local Types = require(script.Parent.Types)
+local Promise = (require(script.Parent.Parent.Promise) :: unknown) :: Types.PromiseLibrary
 
 local DEFAULT_KEY_PREFIX = "Player_"
 local DEFAULT_MIGRATION_METADATA_KEY = "EZProfileStoreVersion"
 
-export type StoreMode = "live" | "studio" | "mock"
-export type Target = Player | number | string
-export type VersionSelector = {
-	version: string?,
-	before: DateTime | number?,
-	stepsBack: number?,
-}
-export type RollbackResult = {
-	key: string,
-	version: string,
-	updatedTime: number,
-	data: { [any]: any },
-}
+type Table = Types.Table
+type Path<Data, V> = Types.Path<Data, V>
+type AnyPath<Data> = Types.AnyPath<Data>
+type Write<Data> = Types.Write<Data>
+export type StoreMode = Types.StoreMode
+export type Target = Types.Target
+type LastSaveReason = Types.LastSaveReason
+type LeaderstatType = Types.LeaderstatType
+export type VersionSelector = Types.VersionSelector
+export type RollbackResult = Types.RollbackResult
+export type LeaderstatEntry<Data> = Types.LeaderstatEntry<Data>
+type ProfileConnection = Types.ProfileConnection
+export type Profile<Data> = Types.Profile<Data>
+type ProfileStore<Data> = Types.ProfileStore<Data>
+type ProfileStoreModule = Types.ProfileStoreModule
+export type Config<Data> = Types.ServerConfig<Data>
+export type MessageHandler = Types.MessageHandler
+export type Server<Data> = Types.Server<Data>
+
 type RollbackSelection = {
 	key: string,
-	profile: any,
-}
-
-export type LeaderstatEntry = {
-	path: Shared.KeyPath,
-	name: string,
-	type: "IntValue" | "NumberValue" | "StringValue",
+	profile: Profile<Table>,
 }
 
 type ResolvedLeaderstatEntry = {
 	path: { string },
 	pathStr: string,
 	name: string,
-	type: "IntValue" | "NumberValue" | "StringValue",
+	type: LeaderstatType,
 }
 
-export type Config = {
-	storeName: string,
-	template: { [any]: any },
-	keyPrefix: string?,
-	mode: StoreMode?,
-	useMockInStudio: boolean?,
-	store: any?,
-	profileStore: any?,
-	migrations: Migrations.Migrations | { Migrations.Input }?,
-	migrateNewProfiles: boolean?,
-	migrationMetadataKey: string?,
-	remoteParent: Instance?,
-	leaderstats: { LeaderstatEntry }?,
-	privatePaths: { Shared.KeyPath }?,
-	validate: ((data: { [any]: any }) -> (boolean, string?))?,
+type HeldUpdate = {
+	player: Player,
+	opcode: string,
+	pathStr: string,
+	valueOrIndex: unknown,
+	value: unknown,
+}
+type HeldEvent = {
+	player: Player,
+	pathStr: string,
+	value: unknown,
+}
+type TransactionState = {
+	undo: { () -> () },
+	updates: { HeldUpdate },
+	events: { HeldEvent },
+	players: { [Player]: true },
 }
 
-export type MessageHandler = (player: Player, message: { [any]: any }, processed: () -> ()) -> ()
 type MessageHandlerEntry = {
 	handler: MessageHandler,
 	active: boolean,
 }
 
-export type Profile = any
 type ValueBase = IntValue | NumberValue | StringValue
-export type Server = typeof(setmetatable(
+
+local Server = {}
+Server.__index = Server
+
+type Self = typeof(setmetatable(
 	{} :: {
-		_store: any,
+		_store: ProfileStore<Table>,
 		_keyPrefix: string,
 		_migrations: Migrations.Migrations?,
 		_migrateNewProfiles: boolean,
 		_migrationMetadataKey: string,
-		_profiles: { [Player]: Profile },
+		_profiles: { [Player]: Profile<Table> },
 		_connections: { RBXScriptConnection },
-		_profileConnections: { [Player]: { RBXScriptConnection } },
+		_profileConnections: { [Player]: { ProfileConnection } },
 		_destroyedSignal: Signal.Signal<>,
 		_dataUpdate: RemoteEvent,
 		_requestData: RemoteFunction,
@@ -184,46 +189,50 @@ export type Server = typeof(setmetatable(
 		_pendingBatches: { [Player]: Shared.Batch },
 		_sequences: { [Player]: number },
 		_dirtyLeaderstats: { [Player]: true },
-		_profileWaits: { [Player]: any },
+		_profileWaits: { [Player]: Types.Promise },
 		_snapshotRequests: { [Player]: true },
 		_flushScheduled: boolean,
 		_privatePaths: { { string } },
-		_validate: ((data: { [any]: any }) -> (boolean, string?))?,
+		_validate: ((data: Table) -> (boolean, string?))?,
 		_messageHandlers: { MessageHandlerEntry },
 		_leaderstatsConfig: { ResolvedLeaderstatEntry },
 		_leaderstats: { [Player]: { [string]: ValueBase } },
 		_rollbackPreviews: { [RollbackResult]: RollbackSelection },
+		_transaction: TransactionState?,
 		IsMock: boolean,
-		ProfileLoaded: Signal.Signal<Player, Profile>,
+		ProfileLoaded: Signal.Signal<Player, Profile<Table>>,
 		ProfileReleased: Signal.Signal<Player>,
-		FirstJoin: Signal.Signal<Player, { [any]: any }>,
-		DataUpdated: Signal.Signal<Player, Shared.KeyPath, any>,
-		PreSave: Signal.Signal<Player, { [any]: any }>,
-		PostSave: Signal.Signal<Player, { [any]: any }>,
-		LastSave: Signal.Signal<Player, "Manual" | "External" | "Shutdown">,
+		FirstJoin: Signal.Signal<Player, Table>,
+		DataUpdated: Signal.Signal<Player, string, unknown>,
+		PreSave: Signal.Signal<Player, Table>,
+		PostSave: Signal.Signal<Player, Table>,
+		LastSave: Signal.Signal<Player, LastSaveReason>,
 		Migrated: Signal.Signal<Player, Migrations.Report>,
 		ProfileLoadFailed: Signal.Signal<Player, string>,
 		RolledBack: Signal.Signal<RollbackResult>,
 	},
-	{} :: { __index: any }
+	Server
 ))
 
-local Server = {}
-Server.__index = Server
+local resolvedProfileStore: ProfileStoreModule? = nil
 
-local resolvedProfileStore: any? = nil
+local requireDynamic: (module: ModuleScript) -> unknown = require
 
-local function requireProfileStoreModule(module: Instance?, location: string): any?
+local function requireProfileStoreModule(module: Instance?, location: string): ProfileStoreModule?
 	if module == nil then
 		return nil
 	end
 	if not module:IsA("ModuleScript") then
 		error(`EZProfileStore.Server: {location} is a {module.ClassName}, expected ModuleScript`, 3)
 	end
-	return require(module)
+	local exports = Shared.asTable(requireDynamic(module))
+	if exports == nil or typeof(exports.New) ~= "function" then
+		error(`EZProfileStore.Server: {location} does not look like ProfileStore (missing New)`, 3)
+	end
+	return (exports :: unknown) :: ProfileStoreModule
 end
 
-local function findProfileStoreInService(serviceName: string): any?
+local function findProfileStoreInService(serviceName: string): ProfileStoreModule?
 	local ok, service = pcall(function()
 		return game:GetService(serviceName)
 	end)
@@ -242,32 +251,28 @@ local function findProfileStoreInService(serviceName: string): any?
 	)
 end
 
-local function getProfileStore(): any
+local function getProfileStore(): ProfileStoreModule
 	if resolvedProfileStore ~= nil then
 		return resolvedProfileStore
 	end
 
 	local packageParent = script.Parent.Parent
-	resolvedProfileStore = requireProfileStoreModule(
+	local found = requireProfileStoreModule(
 		packageParent:FindFirstChild("ProfileStore"),
 		`{packageParent:GetFullName()}.ProfileStore`
+	) or findProfileStoreInService("ServerScriptService") or findProfileStoreInService("ServerStorage") or findProfileStoreInService(
+		"ReplicatedStorage"
 	)
-	if resolvedProfileStore ~= nil then
-		return resolvedProfileStore
-	end
 
-	resolvedProfileStore = findProfileStoreInService("ServerScriptService")
-		or findProfileStoreInService("ServerStorage")
-		or findProfileStoreInService("ReplicatedStorage")
-
-	if resolvedProfileStore == nil then
+	if found == nil then
 		error(
 			"EZProfileStore.Server: could not find ProfileStore. Install EZProfileStore with Wally and mount ServerPackages, or place ProfileStore next to the package in _Index.",
 			3
 		)
 	end
 
-	return resolvedProfileStore
+	resolvedProfileStore = found
+	return found
 end
 
 local function ensureChild(parent: Instance, name: string, className: string): Instance
@@ -291,13 +296,13 @@ local function ensureRemoteFolder(remoteParent: Instance): Folder
 	return ensureChild(remoteParent, Shared.REMOTE_FOLDER_NAME, "Folder") :: Folder
 end
 
-local LEADERSTAT_TYPE_TO_LUA: { [string]: string } = {
+local LEADERSTAT_TYPE_TO_LUA: { [LeaderstatType]: string } = {
 	IntValue = "number",
 	NumberValue = "number",
 	StringValue = "string",
 }
 
-local function validateLeaderstats(template: { [any]: any }, entries: { LeaderstatEntry }): { ResolvedLeaderstatEntry }
+local function validateLeaderstats(template: Table, entries: { LeaderstatEntry<Table> }): { ResolvedLeaderstatEntry }
 	local resolved: { ResolvedLeaderstatEntry } = {}
 	for i, entry in entries do
 		assert(typeof(entry) == "table", `leaderstats[{i}] must be a table`)
@@ -305,8 +310,7 @@ local function validateLeaderstats(template: { [any]: any }, entries: { Leaderst
 		local expectedType = LEADERSTAT_TYPE_TO_LUA[entry.type]
 		assert(expectedType ~= nil, `leaderstats[{i}].type must be IntValue, NumberValue, or StringValue`)
 
-		local path = Shared.resolveKeyPath(entry.path)
-		local pathStr = Shared.toPathString(entry.path)
+		local path, pathStr = Shared.resolvePath(entry.path)
 		local current = Shared.readPath(template, path)
 		assert(current ~= nil, `leaderstats[{i}].path "{pathStr}" does not exist in template`)
 		assert(
@@ -324,48 +328,33 @@ local function validateLeaderstats(template: { [any]: any }, entries: { Leaderst
 	return resolved
 end
 
-local function resolveMigrations(configured: Migrations.Migrations | { Migrations.Input }?): Migrations.Migrations?
-	if configured == nil then
+local function resolveMigrations(configured: (Migrations.Migrations | { Migrations.Input })?): Migrations.Migrations?
+	local candidate = Shared.asTable(configured)
+	if candidate == nil then
 		return nil
 	end
 
-	if
-		typeof((configured :: any).Migrate) == "function"
-		and typeof((configured :: any).GetLatestVersion) == "function"
-	then
-		return configured :: Migrations.Migrations
+	if typeof(candidate.Migrate) == "function" and typeof(candidate.GetLatestVersion) == "function" then
+		return (candidate :: unknown) :: Migrations.Migrations
 	end
 
-	return Migrations.new(configured :: { Migrations.Input })
+	return Migrations.new((candidate :: unknown) :: { Migrations.Input })
 end
 
-local function resolveWritePath(keyPath: Shared.KeyPath): { string }
-	local path = Shared.resolveKeyPath(keyPath)
-	for _, key in path do
-		if not Shared.isValidKey(key) then
-			error(
-				`EZProfileStore: invalid key path "{Shared.toPathString(keyPath)}"; segments must be non-empty strings without "."`,
-				3
-			)
-		end
-	end
-	return path
-end
-
-local function resolvePrivatePaths(configured: { Shared.KeyPath }?): { { string } }
+local function resolvePrivatePaths(configured: { AnyPath<Table> }?): { { string } }
 	local resolved: { { string } } = {}
 	if configured == nil then
 		return resolved
 	end
-	for i, keyPath in configured do
-		local path = Shared.resolveKeyPath(keyPath)
+	for i, entry in configured do
+		local path = Shared.resolvePath(entry)
 		assert(#path > 0, `privatePaths[{i}] must not be empty`)
 		table.insert(resolved, path)
 	end
 	return resolved
 end
 
-local function checkSavable(method: string, label: string, value: any): boolean
+local function checkSavable(method: string, label: string, value: unknown): boolean
 	local ok, reason = Shared.validateValue(value)
 	if not ok then
 		warn(`EZProfileStore: {method} rejected "{label}": {reason}`)
@@ -373,10 +362,7 @@ local function checkSavable(method: string, label: string, value: any): boolean
 	return ok
 end
 
-local function runValidator(
-	validate: ((data: { [any]: any }) -> (boolean, string?))?,
-	data: { [any]: any }
-): (boolean, string?)
+local function runValidator(validate: ((data: Table) -> (boolean, string?))?, data: Table): (boolean, string?)
 	if validate == nil then
 		return true, nil
 	end
@@ -389,23 +375,65 @@ local function runValidator(
 	return true, nil
 end
 
-local function resolveMode(config: Config): StoreMode
-	local mode: StoreMode = config.mode or (if config.useMockInStudio then "studio" else "live")
+local function runTransform<A...>(transform: (A...) -> ...boolean, ...: A...): string?
+	local thread = coroutine.create(transform)
+	local ok, result = coroutine.resume(thread, ...)
+	if coroutine.status(thread) ~= "dead" then
+		coroutine.close(thread)
+		return "transform must not yield"
+	elseif not ok then
+		return `transform errored: {result}`
+	elseif result == false then
+		return ""
+	end
+	return nil
+end
+
+local function truncate<T>(list: { T }, length: number)
+	for i = #list, length + 1, -1 do
+		list[i] = nil
+	end
+end
+
+local function resolveMode(config: Config<Table>): StoreMode
+	local mode: StoreMode = config.mode or "live"
 	assert(mode == "live" or mode == "studio" or mode == "mock", 'config.mode must be "live", "studio", or "mock"')
 	return mode
 end
 
-local function isProfileActive(profile: Profile?): boolean
+local function newLeaderstat(kind: LeaderstatType): ValueBase
+	if kind == "IntValue" then
+		return Instance.new("IntValue")
+	elseif kind == "NumberValue" then
+		return Instance.new("NumberValue")
+	end
+	return Instance.new("StringValue")
+end
+
+local function writeLeaderstat(instance: ValueBase, value: unknown)
+	if instance:IsA("StringValue") then
+		local target = instance :: StringValue
+		if typeof(value) == "string" and target.Value ~= value then
+			target.Value = value
+		end
+	elseif instance:IsA("IntValue") then
+		local target = instance :: IntValue
+		if typeof(value) == "number" and target.Value ~= value then
+			target.Value = value
+		end
+	else
+		local target = instance :: NumberValue
+		if typeof(value) == "number" and target.Value ~= value then
+			target.Value = value
+		end
+	end
+end
+
+local function isProfileActive(profile: Profile<Table>?): boolean
 	return profile ~= nil and (typeof(profile.IsActive) ~= "function" or profile:IsActive())
 end
 
---[=[
-	Creates a store and binds player lifecycle handlers.
-	@within Server
-	@param config Config
-	@return Server
-]=]
-function Server.new(config: Config): Server
+local function construct(config: Config<Table>): Self
 	assert(typeof(config) == "table", "Server.new expects a config table")
 	assert(typeof(config.storeName) == "string", "config.storeName must be a string")
 	assert(typeof(config.template) == "table", "config.template must be a table")
@@ -436,9 +464,11 @@ function Server.new(config: Config): Server
 		"an injected config.store cannot be combined with studio/mock mode"
 	)
 
-	local store = config.store
+	local store: ProfileStore<Table>
 	local isMock = config.store == nil and wantsMock
-	if store == nil then
+	if config.store ~= nil then
+		store = config.store
+	else
 		local ProfileStore = config.profileStore or getProfileStore()
 		assert(typeof(ProfileStore.New) == "function", "config.profileStore must expose ProfileStore.New")
 		store = ProfileStore.New(config.storeName, config.template)
@@ -453,7 +483,7 @@ function Server.new(config: Config): Server
 	local dataUpdate = ensureChild(remoteFolder, Shared.REMOTE_DATA_UPDATE, "RemoteEvent") :: RemoteEvent
 	local requestData = ensureChild(remoteFolder, Shared.REMOTE_REQUEST_DATA, "RemoteFunction") :: RemoteFunction
 
-	local self = setmetatable({
+	local self: Self = setmetatable({
 		_store = store,
 		_keyPrefix = config.keyPrefix or DEFAULT_KEY_PREFIX,
 		_migrations = migrationRunner,
@@ -477,7 +507,8 @@ function Server.new(config: Config): Server
 		_messageHandlers = {},
 		_leaderstatsConfig = resolvedLeaderstats,
 		_leaderstats = {},
-		_rollbackPreviews = setmetatable({}, { __mode = "k" }),
+		_rollbackPreviews = {},
+		_transaction = nil,
 		IsMock = isMock,
 		ProfileLoaded = Signal.new(),
 		ProfileReleased = Signal.new(),
@@ -489,18 +520,12 @@ function Server.new(config: Config): Server
 		Migrated = Signal.new(),
 		ProfileLoadFailed = Signal.new(),
 		RolledBack = Signal.new(),
-	}, Server) :: any
+	}, Server)
+	setmetatable(self._rollbackPreviews, { __mode = "k" })
 
 	requestData.OnServerInvoke = function(player: Player): Shared.Snapshot?
 		return self:_serveSnapshotRequest(player)
 	end
-
-	table.insert(
-		self._connections,
-		Players.PlayerAdded:Connect(function(player)
-			self:_onPlayerAdded(player)
-		end)
-	)
 
 	table.insert(
 		self._connections,
@@ -509,30 +534,49 @@ function Server.new(config: Config): Server
 		end)
 	)
 
-	for _, player in Players:GetPlayers() do
-		task.spawn(function()
-			self:_onPlayerAdded(player)
-		end)
+	if config.autoLoadPlayers ~= false then
+		table.insert(
+			self._connections,
+			Players.PlayerAdded:Connect(function(player)
+				self:_onPlayerAdded(player)
+			end)
+		)
+
+		for _, player in Players:GetPlayers() do
+			task.spawn(function()
+				self:_onPlayerAdded(player)
+			end)
+		end
 	end
 
 	return self
 end
 
 --[=[
+	Creates a store and binds player lifecycle handlers. `Data` is inferred from `config.template`.
+	@within Server
+	@param config Config<Data>
+	@return Server<Data>
+]=]
+function Server.new<Data>(config: Config<Data>): Server<Data>
+	local self = construct((config :: unknown) :: Config<Table>)
+	return (self :: unknown) :: Server<Data>
+end
+
+--[=[
 	Creates a store backed by `ProfileStore.Mock`.
 	@within Server
-	@param config Config
-	@return Server
+	@param config Config<Data>
+	@return Server<Data>
 ]=]
-function Server.mock(config: Config): Server
+function Server.mock<Data>(config: Config<Data>): Server<Data>
 	assert(typeof(config) == "table", "Server.mock expects a config table")
 	local resolved = table.clone(config)
 	resolved.mode = "mock"
-	resolved.useMockInStudio = nil
 	return Server.new(resolved)
 end
 
-function Server._waitForProfile(self: Server, player: Player, timeout: number?): Profile?
+function Server._waitForProfile(self: Self, player: Player, timeout: number?): Profile<Table>?
 	local profile = self._profiles[player]
 	if isProfileActive(profile) then
 		return profile
@@ -544,13 +588,13 @@ function Server._waitForProfile(self: Server, player: Player, timeout: number?):
 	-- Concurrent waiters (including spammed snapshot requests) share one set of listeners.
 	local pending = self._profileWaits[player]
 	if pending == nil then
-		local loaded = Promise.fromEvent(self.ProfileLoaded, function(loadedPlayer)
+		local loaded = Promise.fromEvent(self.ProfileLoaded, function(loadedPlayer: unknown)
 			return loadedPlayer == player
 		end):andThenReturn("loaded")
-		local failed = Promise.fromEvent(self.ProfileLoadFailed, function(failedPlayer)
+		local failed = Promise.fromEvent(self.ProfileLoadFailed, function(failedPlayer: unknown)
 			return failedPlayer == player
 		end):andThenReturn("failed")
-		local leaving = Promise.fromEvent(Players.PlayerRemoving, function(leavingPlayer)
+		local leaving = Promise.fromEvent(Players.PlayerRemoving, function(leavingPlayer: unknown)
 			return leavingPlayer == player
 		end):andThenReturn("left")
 		local destroying = Promise.fromEvent(self._destroyedSignal):andThenReturn("destroyed")
@@ -580,12 +624,12 @@ function Server._waitForProfile(self: Server, player: Player, timeout: number?):
 	return if isProfileActive(profile) then profile else nil
 end
 
-function Server._waitForData(self: Server, player: Player): Shared.Snapshot?
+function Server._waitForData(self: Self, player: Player): Shared.Snapshot?
 	local profile = self:_waitForProfile(player, nil)
 	return if profile then self:_consumeSnapshot(player, profile) else nil
 end
 
-function Server._serveSnapshotRequest(self: Server, player: Player): Shared.Snapshot?
+function Server._serveSnapshotRequest(self: Self, player: Player): Shared.Snapshot?
 	if self._snapshotRequests[player] then
 		return nil
 	end
@@ -601,7 +645,7 @@ function Server._serveSnapshotRequest(self: Server, player: Player): Shared.Snap
 	return snapshot
 end
 
-function Server._consumeSnapshot(self: Server, player: Player, profile: Profile): Shared.Snapshot
+function Server._consumeSnapshot(self: Self, player: Player, profile: Profile<Table>): Shared.Snapshot
 	-- Send the open batch now so its sequence number is covered by this snapshot; the
 	-- requesting client discards it while any already-initialized mirror still applies it.
 	local batch = self._pendingBatches[player]
@@ -616,7 +660,7 @@ function Server._consumeSnapshot(self: Server, player: Player, profile: Profile)
 	}
 end
 
-function Server._disconnectProfileConnections(self: Server, player: Player)
+function Server._disconnectProfileConnections(self: Self, player: Player)
 	local profileConns = self._profileConnections[player]
 	if not profileConns then
 		return
@@ -628,7 +672,7 @@ function Server._disconnectProfileConnections(self: Server, player: Player)
 	self._profileConnections[player] = nil
 end
 
-function Server._releaseProfile(self: Server, player: Player, profile: Profile, shouldKick: boolean)
+function Server._releaseProfile(self: Self, player: Player, profile: Profile<Table>, shouldKick: boolean)
 	if self._profiles[player] ~= profile then
 		return
 	end
@@ -645,7 +689,7 @@ function Server._releaseProfile(self: Server, player: Player, profile: Profile, 
 	end
 end
 
-function Server._migrateProfile(self: Server, player: Player, profile: Profile, key: string): (boolean, string?)
+function Server._migrateProfile(self: Self, player: Player, profile: Profile<Table>, key: string): (boolean, string?)
 	local runner = self._migrations
 	if runner == nil then
 		return true, nil
@@ -659,15 +703,15 @@ function Server._migrateProfile(self: Server, player: Player, profile: Profile, 
 	end
 
 	local metadata = profile.RobloxMetaData
-	local storedVersion = metadata[self._migrationMetadataKey]
+	local rawVersion = metadata[self._migrationMetadataKey]
 	local latestVersion = runner:GetLatestVersion()
-	if storedVersion == nil then
+	local storedVersion: number
+	if rawVersion == nil then
 		storedVersion = if profile.SessionLoadCount == 1 and not self._migrateNewProfiles then latestVersion else 0
-	end
-
-	if typeof(storedVersion) ~= "number" or storedVersion < 0 or storedVersion % 1 ~= 0 then
-		return false,
-			`invalid schema version {tostring(storedVersion)} in Roblox metadata "{self._migrationMetadataKey}"`
+	elseif typeof(rawVersion) == "number" and rawVersion >= 0 and rawVersion % 1 == 0 then
+		storedVersion = rawVersion
+	else
+		return false, `invalid schema version {tostring(rawVersion)} in Roblox metadata "{self._migrationMetadataKey}"`
 	end
 
 	local ok, report = pcall(function()
@@ -687,7 +731,7 @@ function Server._migrateProfile(self: Server, player: Player, profile: Profile, 
 	return true, nil
 end
 
-function Server._prepareProfile(self: Server, player: Player, profile: Profile, key: string): (boolean, string?)
+function Server._prepareProfile(self: Self, player: Player, profile: Profile<Table>, key: string): (boolean, string?)
 	local migrationOk, migrationError = self:_migrateProfile(player, profile, key)
 	if not migrationOk then
 		return false, migrationError
@@ -697,22 +741,31 @@ function Server._prepareProfile(self: Server, player: Player, profile: Profile, 
 	return runValidator(self._validate, profile.Data)
 end
 
-function Server._onPlayerAdded(self: Server, player: Player)
+function Server._onPlayerAdded(self: Self, player: Player)
 	if self._isDestroyed then
 		return
 	end
 
 	local key = self:GetKey(player)
-	local profile = self._store:StartSessionAsync(key, {
+	local params: Types.StartSessionParams = {
 		Cancel = function()
 			return player.Parent ~= Players
 		end,
-	})
+	}
+	local started, result = pcall(self._store.StartSessionAsync, self._store, key, params)
+	local profile = if started then result else nil
 
 	if not profile then
-		local reason = "ProfileStore could not start a profile session"
+		local reason = if started
+			then "ProfileStore could not start a profile session"
+			else `StartSessionAsync errored for "{key}": {result}`
+		if not started then
+			warn(`EZProfileStore: {reason}`)
+		end
 		self.ProfileLoadFailed:Fire(player, reason)
-		player:Kick("Failed to load data, please rejoin")
+		if player.Parent == Players then
+			player:Kick("Failed to load data, please rejoin")
+		end
 		return
 	end
 
@@ -763,7 +816,7 @@ function Server._onPlayerAdded(self: Server, player: Player)
 	end
 end
 
-function Server._attachMessageHandler(self: Server, player: Player, profile: Profile, entry: MessageHandlerEntry)
+function Server._attachMessageHandler(self: Self, player: Player, profile: Profile<Table>, entry: MessageHandlerEntry)
 	profile:MessageHandler(function(message, processed)
 		if entry.active and self._profiles[player] == profile then
 			entry.handler(player, message, processed)
@@ -771,7 +824,7 @@ function Server._attachMessageHandler(self: Server, player: Player, profile: Pro
 	end)
 end
 
-function Server._onPlayerRemoving(self: Server, player: Player)
+function Server._onPlayerRemoving(self: Self, player: Player)
 	self._leaderstats[player] = nil
 	self._pendingBatches[player] = nil
 	self._sequences[player] = nil
@@ -786,7 +839,7 @@ function Server._onPlayerRemoving(self: Server, player: Player)
 	end
 end
 
-function Server._buildLeaderstats(self: Server, player: Player)
+function Server._buildLeaderstats(self: Self, player: Player)
 	if #self._leaderstatsConfig == 0 then
 		return
 	end
@@ -803,9 +856,11 @@ function Server._buildLeaderstats(self: Server, player: Player)
 	local leaderstatCount = #self._leaderstatsConfig
 
 	for index, entry in self._leaderstatsConfig do
-		local instance = Instance.new(entry.type)
+		local stat = newLeaderstat(entry.type)
+		writeLeaderstat(stat, Shared.readPath(data, entry.path))
+
+		local instance: Instance = stat
 		instance.Name = entry.name
-		instance.Value = Shared.readPath(data, entry.path)
 
 		local priority = Instance.new("NumberValue")
 		priority.Name = "Priority"
@@ -813,14 +868,14 @@ function Server._buildLeaderstats(self: Server, player: Player)
 		priority.Parent = instance
 
 		instance.Parent = folder
-		mirror[entry.pathStr] = instance
+		mirror[entry.pathStr] = stat
 	end
 
 	self._leaderstats[player] = mirror
 	folder.Parent = player
 end
 
-function Server._mirrorLeaderstats(self: Server, player: Player)
+function Server._mirrorLeaderstats(self: Self, player: Player)
 	local mirror = self._leaderstats[player]
 	if not mirror then
 		return
@@ -834,39 +889,149 @@ function Server._mirrorLeaderstats(self: Server, player: Player)
 	for _, entry in self._leaderstatsConfig do
 		local instance = mirror[entry.pathStr]
 		if instance then
-			local current = Shared.readPath(data, entry.path)
-			if current ~= nil and instance.Value ~= current then
-				instance.Value = current
-			end
+			writeLeaderstat(instance, Shared.readPath(data, entry.path))
 		end
 	end
 end
 
-function Server._applySet(self: Server, player: Player, data: { [any]: any }, path: { string }, value: any): boolean
-	if not Shared.writePath(data, path, value, false) then
+local function captureSetUndo(data: Table, path: { string }): () -> ()
+	local target = data
+	for i = 1, #path - 1 do
+		local key = path[i]
+		local child = Shared.asTable(target[key])
+		if child == nil then
+			local parent, old = target, target[key]
+			return function()
+				parent[key] = old
+			end
+		end
+		target = child
+	end
+
+	local parent, key = target, path[#path]
+	local old = parent[key]
+	return function()
+		parent[key] = old
+	end
+end
+
+function Server._recordUndo(self: Self, player: Player, undo: () -> ())
+	local transaction = self._transaction
+	if transaction then
+		table.insert(transaction.undo, undo)
+		transaction.players[player] = true
+	end
+end
+
+function Server._write(
+	self: Self,
+	player: Player,
+	data: Table,
+	path: { string },
+	value: unknown,
+	isInsert: boolean
+): boolean
+	local transaction = self._transaction
+	local insertTarget = if transaction and isInsert then Shared.readArray(data, path) else nil
+	local setUndo = if transaction and not isInsert then captureSetUndo(data, path) else nil
+
+	if not Shared.writePath(data, path, value, isInsert) then
 		return false
 	end
-	self:_queueUpdate(player, if value == nil then Shared.OP.Del else Shared.OP.Set, path, value)
+	if insertTarget then
+		self:_recordUndo(player, function()
+			table.remove(insertTarget)
+		end)
+	elseif setUndo then
+		self:_recordUndo(player, setUndo)
+	end
+	return true
+end
+
+function Server._arrayWrite(
+	self: Self,
+	player: Player,
+	data: Table,
+	path: { string },
+	index: number,
+	value: unknown,
+	isRemove: boolean
+): boolean
+	local array = if self._transaction then Shared.readArray(data, path) else nil
+	local old = if array then array[index] else nil
+	local changed = if isRemove
+		then Shared.arrayRemove(data, path, index)
+		else Shared.arrayUpdate(data, path, index, value)
+	if not changed then
+		return false
+	end
+
+	if array then
+		self:_recordUndo(player, function()
+			if isRemove then
+				table.insert(array, index, old)
+			else
+				array[index] = old
+			end
+		end)
+	end
+	return true
+end
+
+function Server._validatePlayers(self: Self, players: { [Player]: true }): string?
+	for player in players do
+		local data = self:GetData(player)
+		if data then
+			local valid, reason = runValidator(self._validate, data)
+			if not valid then
+				return `rejected by validate: {reason}`
+			end
+		end
+	end
+	return nil
+end
+
+function Server._emitUpdated(self: Self, player: Player, pathStr: string, value: unknown)
+	local transaction = self._transaction
+	if transaction then
+		table.insert(transaction.events, { player = player, pathStr = pathStr, value = value })
+	else
+		self.DataUpdated:Fire(player, pathStr, value)
+	end
+end
+
+function Server._applySet(
+	self: Self,
+	player: Player,
+	data: Table,
+	path: { string },
+	pathStr: string,
+	value: unknown
+): boolean
+	if not self:_write(player, data, path, value, false) then
+		return false
+	end
+	self:_queueUpdate(player, if value == nil then Shared.OP.Del else Shared.OP.Set, path, pathStr, value)
 	return true
 end
 
 -- Sets or deletes one path, then replicates and signals the change.
 function Server._commitSet(
-	self: Server,
+	self: Self,
 	player: Player,
-	data: { [any]: any },
+	data: Table,
 	path: { string },
-	keyPath: Shared.KeyPath,
-	value: any
+	pathStr: string,
+	value: unknown
 ): boolean
-	if not self:_applySet(player, data, path, value) then
+	if not self:_applySet(player, data, path, pathStr, value) then
 		return false
 	end
-	self.DataUpdated:Fire(player, keyPath, value)
+	self:_emitUpdated(player, pathStr, value)
 	return true
 end
 
-function Server._isPrivate(self: Server, path: { string }): boolean
+function Server._isPrivate(self: Self, path: { string }): boolean
 	for _, privatePath in self._privatePaths do
 		if Shared.isPrefix(privatePath, path) then
 			return true
@@ -876,12 +1041,13 @@ function Server._isPrivate(self: Server, path: { string }): boolean
 end
 
 -- Copies at queue time so later in-frame writes cannot leak into this op's payload.
-function Server._replicatedCopy(self: Server, path: { string }, value: any, stripPrivate: boolean): any
+function Server._replicatedCopy(self: Self, path: { string }, value: unknown, stripPrivate: boolean): unknown
 	local copy = Shared.deepCopy(value)
-	if stripPrivate and typeof(copy) == "table" then
+	local copyTable = Shared.asTable(copy)
+	if stripPrivate and copyTable then
 		for _, privatePath in self._privatePaths do
 			if #privatePath > #path and Shared.isPrefix(path, privatePath) then
-				Shared.writePath(copy, table.move(privatePath, #path + 1, #privatePath, 1, {}), nil, false)
+				Shared.writePath(copyTable, table.move(privatePath, #path + 1, #privatePath, 1, {}), nil, false)
 			end
 		end
 	end
@@ -889,12 +1055,13 @@ function Server._replicatedCopy(self: Server, path: { string }, value: any, stri
 end
 
 function Server._queueUpdate(
-	self: Server,
+	self: Self,
 	player: Player,
 	opcode: string,
 	path: { string },
-	valueOrIndex: any,
-	value: any?
+	pathStr: string,
+	valueOrIndex: unknown?,
+	value: unknown?
 )
 	if self._leaderstats[player] then
 		self._dirtyLeaderstats[player] = true
@@ -907,7 +1074,28 @@ function Server._queueUpdate(
 	valueOrIndex = self:_replicatedCopy(path, valueOrIndex, opcode == Shared.OP.Set)
 	value = self:_replicatedCopy(path, value, false)
 
-	local pathStr = table.concat(path, ".")
+	local transaction = self._transaction
+	if transaction then
+		table.insert(transaction.updates, {
+			player = player,
+			opcode = opcode,
+			pathStr = pathStr,
+			valueOrIndex = valueOrIndex,
+			value = value,
+		})
+		return
+	end
+	self:_appendToBatch(player, opcode, pathStr, valueOrIndex, value)
+end
+
+function Server._appendToBatch(
+	self: Self,
+	player: Player,
+	opcode: string,
+	pathStr: string,
+	valueOrIndex: unknown,
+	value: unknown
+)
 	local batch = self._pendingBatches[player]
 	if not batch then
 		batch = {}
@@ -932,11 +1120,12 @@ function Server._queueUpdate(
 		end
 	end
 
-	table.insert(batch, { opcode, pathStr, valueOrIndex, value :: any })
+	local entry: Shared.Update = { opcode, pathStr, valueOrIndex, value }
+	table.insert(batch, entry)
 	self:_scheduleFlush()
 end
 
-function Server._scheduleFlush(self: Server)
+function Server._scheduleFlush(self: Self)
 	if self._flushScheduled or self._isDestroyed then
 		return
 	end
@@ -947,7 +1136,7 @@ function Server._scheduleFlush(self: Server)
 	end)
 end
 
-function Server._flushUpdates(self: Server)
+function Server._flushUpdates(self: Self)
 	self._flushScheduled = false
 	if self._isDestroyed then
 		return
@@ -966,7 +1155,7 @@ function Server._flushUpdates(self: Server)
 	end
 end
 
-function Server._sendBatch(self: Server, player: Player, batch: Shared.Batch)
+function Server._sendBatch(self: Self, player: Player, batch: Shared.Batch)
 	if #batch > 0 and player.Parent == Players then
 		self._dataUpdate:FireClient(player, self._sequences[player], batch)
 	end
@@ -977,9 +1166,9 @@ end
 	@within Server
 	@method GetProfile
 	@param player Player
-	@return Profile?
+	@return Profile<Data>?
 ]=]
-function Server.GetProfile(self: Server, player: Player): Profile?
+function Server.GetProfile(self: Self, player: Player): Profile<Table>?
 	local profile = self._profiles[player]
 	return if isProfileActive(profile) then profile else nil
 end
@@ -991,22 +1180,22 @@ end
 	@yields
 	@param player Player
 	@param timeout number? -- Waits until the profile loads, fails, or the player leaves by default.
-	@return Profile?
+	@return Profile<Data>?
 ]=]
-function Server.GetProfileAsync(self: Server, player: Player, timeout: number?): Profile?
+function Server.GetProfileAsync(self: Self, player: Player, timeout: number?): Profile<Table>?
 	return self:_waitForProfile(player, timeout)
 end
 
 --[=[
-	Returns the active profile's data by reference.
+	Returns the active profile's data, typed read-only.
 	@within Server
 	@method GetData
 	@param player Player
-	@return { [any]: any }?
+	@return ReadOnly<Data>?
 ]=]
-function Server.GetData(self: Server, player: Player): { [any]: any }?
+function Server.GetData(self: Self, player: Player): Table?
 	local profile = self:GetProfile(player)
-	return profile and profile.Data
+	return if profile then profile.Data else nil
 end
 
 --[=[
@@ -1016,9 +1205,9 @@ end
 	@yields
 	@param player Player
 	@param timeout number? -- Waits until the profile loads, fails, or the player leaves by default.
-	@return { [any]: any }?
+	@return ReadOnly<Data>?
 ]=]
-function Server.GetDataAsync(self: Server, player: Player, timeout: number?): { [any]: any }?
+function Server.GetDataAsync(self: Self, player: Player, timeout: number?): Table?
 	if self:GetProfileAsync(player, timeout) == nil then
 		return nil
 	end
@@ -1032,10 +1221,10 @@ end
 	@param target Target
 	@return string
 ]=]
-function Server.GetKey(self: Server, target: Target): string
+function Server.GetKey(self: Self, target: Target): string
 	if typeof(target) == "Instance" then
 		assert(target:IsA("Player"), "target Instance must be a Player")
-		return self._keyPrefix .. tostring((target :: Player).UserId)
+		return self._keyPrefix .. tostring(target.UserId)
 	elseif typeof(target) == "number" then
 		assert(target % 1 == 0, "numeric target must be an integer UserId")
 		return self._keyPrefix .. tostring(target)
@@ -1051,9 +1240,9 @@ end
 	Returns the underlying ProfileStore object.
 	@within Server
 	@method GetStore
-	@return any
+	@return ProfileStore<Data>
 ]=]
-function Server.GetStore(self: Server): any
+function Server.GetStore(self: Self): ProfileStore<Table>
 	return self._store
 end
 
@@ -1062,37 +1251,37 @@ end
 	@within Server
 	@method ReadData
 	@param player Player
-	@param keyPath KeyPath -- Dot-notation string or array of segments.
-	@return any
+	@param path Path<Data, V>
+	@return ReadOnly<V>?
 ]=]
-function Server.ReadData(self: Server, player: Player, keyPath: Shared.KeyPath): any
+function Server.ReadData(self: Self, player: Player, path: unknown): unknown
 	local data = self:GetData(player)
 	if not data then
 		return nil
 	end
-	return Shared.readPath(data, Shared.resolveKeyPath(keyPath))
+	return Shared.readPath(data, (Shared.resolvePath(path)))
 end
 
 --[=[
-	Sets or deletes a profile path.
+	Sets a profile path. Use `RemoveData` to delete one.
 	@within Server
 	@method UpdateData
 	@param player Player
-	@param keyPath KeyPath
-	@param value any -- Passing `nil` deletes the path.
+	@param path Path<Data, V>
+	@param value V
 	@return boolean -- `true` if the value changed, `false` otherwise.
 ]=]
-function Server.UpdateData(self: Server, player: Player, keyPath: Shared.KeyPath, value: any): boolean
-	local path = resolveWritePath(keyPath)
+function Server.UpdateData(self: Self, player: Player, path: unknown, value: unknown): boolean
+	local keys, pathStr = Shared.resolvePath(path)
 	local data = self:GetData(player)
 	if not data then
 		return false
 	end
-	if value ~= nil and not checkSavable("UpdateData", Shared.toPathString(keyPath), value) then
+	if value ~= nil and not checkSavable("UpdateData", pathStr, value) then
 		return false
 	end
 
-	return self:_commitSet(player, data, path, keyPath, value)
+	return self:_commitSet(player, data, keys, pathStr, value)
 end
 
 --[=[
@@ -1100,27 +1289,27 @@ end
 	@within Server
 	@method InsertData
 	@param player Player
-	@param keyPath KeyPath
-	@param value any
+	@param path Path<Data, { V }>
+	@param value V
 	@return boolean -- `true` on success, `false` if the target is not a table.
 ]=]
-function Server.InsertData(self: Server, player: Player, keyPath: Shared.KeyPath, value: any): boolean
-	local path = resolveWritePath(keyPath)
+function Server.InsertData(self: Self, player: Player, path: unknown, value: unknown): boolean
+	local keys, pathStr = Shared.resolvePath(path)
 	local data = self:GetData(player)
 	if not data then
 		return false
 	end
-	if not checkSavable("InsertData", Shared.toPathString(keyPath), value) then
+	if not checkSavable("InsertData", pathStr, value) then
 		return false
 	end
 
-	if not Shared.writePath(data, path, value, true) then
-		warn(`EZProfileStore: InsertData target at "{Shared.toPathString(keyPath)}" is not a table`)
+	if not self:_write(player, data, keys, value, true) then
+		warn(`EZProfileStore: InsertData target at "{pathStr}" is not a table`)
 		return false
 	end
 
-	self:_queueUpdate(player, Shared.OP.Ins, path, value)
-	self.DataUpdated:Fire(player, keyPath, value)
+	self:_queueUpdate(player, Shared.OP.Ins, keys, pathStr, value)
+	self:_emitUpdated(player, pathStr, value)
 	return true
 end
 
@@ -1129,34 +1318,33 @@ end
 	@within Server
 	@method IncrementData
 	@param player Player
-	@param keyPath KeyPath
+	@param path Path<Data, number>
 	@param delta number? -- Defaults to `1`.
 	@return boolean
 ]=]
-function Server.IncrementData(self: Server, player: Player, keyPath: Shared.KeyPath, delta: number?): boolean
-	local path = resolveWritePath(keyPath)
+function Server.IncrementData(self: Self, player: Player, path: unknown, delta: number?): boolean
+	local keys, pathStr = Shared.resolvePath(path)
 	local data = self:GetData(player)
 	if not data then
 		return false
 	end
 
-	local current = Shared.readPath(data, path)
-	if current ~= nil and typeof(current) ~= "number" then
-		warn(`EZProfileStore: IncrementData target at "{Shared.toPathString(keyPath)}" is not a number`)
+	local current = Shared.readPath(data, keys)
+	local base: number
+	if current == nil then
+		base = 0
+	elseif typeof(current) == "number" then
+		base = current
+	else
+		warn(`EZProfileStore: IncrementData target at "{pathStr}" is not a number`)
 		return false
 	end
 
-	local newValue = (current or 0) + (delta or 1)
-	if not checkSavable("IncrementData", Shared.toPathString(keyPath), newValue) then
+	local newValue = base + (delta or 1)
+	if not checkSavable("IncrementData", pathStr, newValue) then
 		return false
 	end
-	if not Shared.writePath(data, path, newValue, false) then
-		return false
-	end
-
-	self:_queueUpdate(player, Shared.OP.Set, path, newValue)
-	self.DataUpdated:Fire(player, keyPath, newValue)
-	return true
+	return self:_commitSet(player, data, keys, pathStr, newValue)
 end
 
 --[=[
@@ -1164,12 +1352,12 @@ end
 	@within Server
 	@method DecrementData
 	@param player Player
-	@param keyPath KeyPath
+	@param path Path<Data, number>
 	@param delta number? -- Defaults to `1`.
 	@return boolean
 ]=]
-function Server.DecrementData(self: Server, player: Player, keyPath: Shared.KeyPath, delta: number?): boolean
-	return self:IncrementData(player, keyPath, -(delta or 1))
+function Server.DecrementData(self: Self, player: Player, path: unknown, delta: number?): boolean
+	return self:IncrementData(player, path, -(delta or 1))
 end
 
 --[=[
@@ -1177,27 +1365,17 @@ end
 	@within Server
 	@method RemoveData
 	@param player Player
-	@param keyPath KeyPath
+	@param path AnyPath<Data>
 	@return boolean
 ]=]
-function Server.RemoveData(self: Server, player: Player, keyPath: Shared.KeyPath): boolean
-	local path = resolveWritePath(keyPath)
+function Server.RemoveData(self: Self, player: Player, path: unknown): boolean
+	local keys, pathStr = Shared.resolvePath(path)
 	local data = self:GetData(player)
 	if not data then
 		return false
 	end
 
-	if Shared.readPath(data, path) == nil then
-		return false
-	end
-
-	if not Shared.writePath(data, path, nil, false) then
-		return false
-	end
-
-	self:_queueUpdate(player, Shared.OP.Del, path)
-	self.DataUpdated:Fire(player, keyPath, nil)
-	return true
+	return self:_commitSet(player, data, keys, pathStr, nil)
 end
 
 --[=[
@@ -1205,33 +1383,27 @@ end
 	@within Server
 	@method UpdateArrayItem
 	@param player Player
-	@param arrayPath KeyPath -- Path to the array.
+	@param path Path<Data, { V }> -- Path to the array.
 	@param index number
-	@param value any
+	@param value V
 	@return boolean
 ]=]
-function Server.UpdateArrayItem(
-	self: Server,
-	player: Player,
-	arrayPath: Shared.KeyPath,
-	index: number,
-	value: any
-): boolean
-	local path = resolveWritePath(arrayPath)
+function Server.UpdateArrayItem(self: Self, player: Player, path: unknown, index: number, value: unknown): boolean
+	local keys, pathStr = Shared.resolvePath(path)
 	local data = self:GetData(player)
 	if not data then
 		return false
 	end
-	if not checkSavable("UpdateArrayItem", Shared.toPathString(arrayPath), value) then
+	if not checkSavable("UpdateArrayItem", pathStr, value) then
 		return false
 	end
 
-	if not Shared.arrayUpdate(data, path, index, value) then
+	if not self:_arrayWrite(player, data, keys, index, value, false) then
 		return false
 	end
 
-	self:_queueUpdate(player, Shared.OP.AUpd, path, index, value)
-	self.DataUpdated:Fire(player, arrayPath, value)
+	self:_queueUpdate(player, Shared.OP.AUpd, keys, pathStr, index, value)
+	self:_emitUpdated(player, pathStr, value)
 	return true
 end
 
@@ -1240,35 +1412,35 @@ end
 	@within Server
 	@method RemoveArrayItem
 	@param player Player
-	@param arrayPath KeyPath
+	@param path Path<Data, { V }>
 	@param index number
 	@return boolean
 ]=]
-function Server.RemoveArrayItem(self: Server, player: Player, arrayPath: Shared.KeyPath, index: number): boolean
-	local path = resolveWritePath(arrayPath)
+function Server.RemoveArrayItem(self: Self, player: Player, path: unknown, index: number): boolean
+	local keys, pathStr = Shared.resolvePath(path)
 	local data = self:GetData(player)
 	if not data then
 		return false
 	end
 
-	if not Shared.arrayRemove(data, path, index) then
+	if not self:_arrayWrite(player, data, keys, index, nil, true) then
 		return false
 	end
 
-	self:_queueUpdate(player, Shared.OP.ARm, path, index)
-	self.DataUpdated:Fire(player, arrayPath, nil)
+	self:_queueUpdate(player, Shared.OP.ARm, keys, pathStr, index)
+	self:_emitUpdated(player, pathStr, nil)
 	return true
 end
 
 --[=[
-	Applies and batches multiple set/delete operations.
+	Applies several `Path.write` entries in one replication batch.
 	@within Server
 	@method BatchSetValues
 	@param player Player
-	@param writes { { path: KeyPath, value: any } }
-	@return number
+	@param writes { Write<Data> }
+	@return number -- How many paths changed.
 ]=]
-function Server.BatchSetValues(self: Server, player: Player, writes: { { path: Shared.KeyPath, value: any } }): number
+function Server.BatchSetValues(self: Self, player: Player, writes: { Write<Table> }): number
 	local data = self:GetData(player)
 	if not data then
 		return 0
@@ -1276,11 +1448,11 @@ function Server.BatchSetValues(self: Server, player: Player, writes: { { path: S
 
 	local changed = 0
 	for _, write in writes do
-		local path = resolveWritePath(write.path)
-		if write.value ~= nil and not checkSavable("BatchSetValues", Shared.toPathString(write.path), write.value) then
+		local keys, pathStr = Shared.resolvePath(write.path)
+		if write.value ~= nil and not checkSavable("BatchSetValues", pathStr, write.value) then
 			continue
 		end
-		if self:_commitSet(player, data, path, write.path, write.value) then
+		if self:_commitSet(player, data, keys, pathStr, write.value) then
 			changed += 1
 		end
 	end
@@ -1288,28 +1460,14 @@ function Server.BatchSetValues(self: Server, player: Player, writes: { { path: S
 end
 
 --[=[
-	Edits a draft copy of the player's data and commits it all-or-nothing.
-
-	The transform must not yield. If it errors, returns `false`, produces unsavable
-	values, or fails `config.validate`, live data is untouched. Otherwise the draft is
-	diffed against live data and only the changed paths are written and replicated.
-
-	```lua
-	store:Mutate(player, function(data)
-		if data.Coins < 100 then
-			return false
-		end
-		data.Coins -= 100
-		table.insert(data.Inventory, "Sword")
-	end)
-	```
+	Edits a copy of the player's data and commits the changed paths all-or-nothing.
 	@within Server
 	@method Mutate
 	@param player Player
-	@param transform (data: { [any]: any }) -> ...boolean
+	@param transform (draft: Data) -> ...boolean
 	@return boolean -- `true` if the draft was committed.
 ]=]
-function Server.Mutate(self: Server, player: Player, transform: (data: { [any]: any }) -> ...boolean): boolean
+function Server.Mutate(self: Self, player: Player, transform: (draft: Table) -> ...boolean): boolean
 	assert(typeof(transform) == "function", "Mutate expects a transform function")
 	return self:MutateMany({ player }, function(drafts)
 		return transform(drafts[player])
@@ -1317,26 +1475,23 @@ function Server.Mutate(self: Server, player: Player, transform: (data: { [any]: 
 end
 
 --[=[
-	Like `Mutate`, but commits drafts for several loaded players together or not at all.
-
-	Use it for trades so a failed check cannot leave one side changed. ProfileStore still
-	saves each profile independently, so this is atomic in memory, not across a server crash.
+	Like `Mutate`, for several loaded players at once.
 	@within Server
 	@method MutateMany
 	@param players { Player }
-	@param transform (drafts: { [Player]: { [any]: any } }) -> ...boolean
+	@param transform (drafts: { [Player]: Data }) -> ...boolean
 	@return boolean -- `true` if every draft was committed.
 ]=]
 function Server.MutateMany(
-	self: Server,
+	self: Self,
 	players: { Player },
-	transform: (drafts: { [Player]: { [any]: any } }) -> ...boolean
+	transform: (drafts: { [Player]: Table }) -> ...boolean
 ): boolean
 	assert(typeof(players) == "table" and #players > 0, "MutateMany expects a non-empty player list")
 	assert(typeof(transform) == "function", "MutateMany expects a transform function")
 
-	local originals: { [Player]: { [any]: any } } = {}
-	local drafts: { [Player]: { [any]: any } } = {}
+	local originals: { [Player]: Table } = {}
+	local drafts: { [Player]: Table } = {}
 	for _, player in players do
 		assert(drafts[player] == nil, "MutateMany players must be unique")
 		local data = self:GetData(player)
@@ -1347,36 +1502,29 @@ function Server.MutateMany(
 		drafts[player] = Shared.deepCopy(data)
 	end
 
-	-- A yielding transform could interleave with other writes and commit a stale diff.
-	local thread = coroutine.create(transform)
-	local ok, result = coroutine.resume(thread, drafts)
-	if coroutine.status(thread) ~= "dead" then
-		coroutine.close(thread)
-		warn("EZProfileStore: Mutate transform must not yield; changes were discarded")
-		return false
-	elseif not ok then
-		warn(`EZProfileStore: Mutate transform errored; changes were discarded: {result}`)
-		return false
-	elseif result == false then
+	local failure = runTransform(transform, drafts)
+	if failure ~= nil then
+		if failure ~= "" then
+			warn(`EZProfileStore: Mutate {failure}; changes were discarded`)
+		end
 		return false
 	end
 
 	local changesByPlayer: { [Player]: { Shared.Change } } = {}
 	for _, player in players do
-		local draft = drafts[player]
-		if typeof(draft) ~= "table" then
+		local draft = Shared.asTable(drafts[player])
+		if draft == nil then
 			warn("EZProfileStore: Mutate drafts must remain tables")
 			return false
 		end
 
-		local changes = Shared.diff(originals[player], draft)
+		local changes, invalidKey = Shared.diff(originals[player], draft)
+		if changes == nil then
+			warn(`EZProfileStore: Mutate rejected key {tostring(invalidKey)}; keys must be strings without "."`)
+			return false
+		end
 		for _, change in changes do
-			local key = change.path[1]
-			if not Shared.isValidKey(key) then
-				warn(`EZProfileStore: Mutate rejected root key {tostring(key)}; keys must be strings without "."`)
-				return false
-			end
-			if change.value ~= nil and not checkSavable("Mutate", table.concat(change.path, "."), change.value) then
+			if change.value ~= nil and not checkSavable("Mutate", change.key, change.value) then
 				return false
 			end
 		end
@@ -1395,29 +1543,74 @@ function Server.MutateMany(
 	for _, player in players do
 		local data = originals[player]
 		for _, change in changesByPlayer[player] do
-			if self:_applySet(player, data, change.path, change.value) then
+			if self:_applySet(player, data, change.path, change.key, change.value) then
 				table.insert(committed, { player = player, change = change })
 			end
 		end
 	end
 
 	for _, entry in committed do
-		self.DataUpdated:Fire(entry.player, entry.change.path, entry.change.value)
+		self:_emitUpdated(entry.player, entry.change.key, entry.change.value)
+	end
+	return true
+end
+
+--[=[
+	Makes the mutations inside `transform` all-or-nothing; replication waits until commit.
+	@within Server
+	@method Transaction
+	@param transform () -> ...boolean
+	@return boolean -- `true` if the writes were committed.
+]=]
+function Server.Transaction(self: Self, transform: () -> ...boolean): boolean
+	assert(typeof(transform) == "function", "Transaction expects a transform function")
+
+	local outer = self._transaction
+	local transaction: TransactionState = outer or { undo = {}, updates = {}, events = {}, players = {} }
+	local undoMark, updateMark, eventMark = #transaction.undo, #transaction.updates, #transaction.events
+	self._transaction = transaction
+
+	local failure = runTransform(transform)
+	if failure == nil and outer == nil then
+		failure = self:_validatePlayers(transaction.players)
+	end
+
+	if failure ~= nil then
+		for i = #transaction.undo, undoMark + 1, -1 do
+			transaction.undo[i]()
+		end
+		truncate(transaction.undo, undoMark)
+		truncate(transaction.updates, updateMark)
+		truncate(transaction.events, eventMark)
+		self._transaction = outer
+		if failure ~= "" then
+			warn(`EZProfileStore: Transaction {failure}; changes were rolled back`)
+		end
+		return false
+	elseif outer ~= nil then
+		return true
+	end
+
+	self._transaction = nil
+	for _, update in transaction.updates do
+		self:_appendToBatch(update.player, update.opcode, update.pathStr, update.valueOrIndex, update.value)
+	end
+	for _, event in transaction.events do
+		self.DataUpdated:Fire(event.player, event.pathStr, event.value)
 	end
 	return true
 end
 
 --[=[
 	Sends a message to a profile, online or offline, via `ProfileStore:MessageAsync`.
-	Useful for gifts and admin grants; handle it with `OnMessage`.
 	@within Server
 	@method SendMessageAsync
 	@yields
 	@param target Target
-	@param message { [any]: any }
+	@param message Table
 	@return boolean
 ]=]
-function Server.SendMessageAsync(self: Server, target: Target, message: { [any]: any }): boolean
+function Server.SendMessageAsync(self: Self, target: Target, message: Table): boolean
 	assert(typeof(message) == "table", "message must be a table")
 	local key = self:GetKey(target)
 	if not checkSavable("SendMessageAsync", key, message) then
@@ -1427,24 +1620,13 @@ function Server.SendMessageAsync(self: Server, target: Target, message: { [any]:
 end
 
 --[=[
-	Handles messages for loaded profiles, including ones already waiting. Call `processed`
-	after applying a message (usually with `Mutate`) so it is not delivered again.
-
-	```lua
-	store:OnMessage(function(player, message, processed)
-		if message.type == "Gift" and store:Mutate(player, function(data)
-			data.Coins += message.coins
-		end) then
-			processed()
-		end
-	end)
-	```
+	Handles profile messages; call `processed` once a message is applied.
 	@within Server
 	@method OnMessage
 	@param handler MessageHandler
 	@return () -> () -- Disconnects the handler.
 ]=]
-function Server.OnMessage(self: Server, handler: MessageHandler): () -> ()
+function Server.OnMessage(self: Self, handler: MessageHandler): () -> ()
 	assert(typeof(handler) == "function", "OnMessage expects a function")
 	local entry: MessageHandlerEntry = { handler = handler, active = true }
 	table.insert(self._messageHandlers, entry)
@@ -1469,7 +1651,7 @@ end
 	@param player Player
 	@return boolean
 ]=]
-function Server.SaveAsync(self: Server, player: Player): boolean
+function Server.SaveAsync(self: Self, player: Player): boolean
 	local profile = self:GetProfile(player)
 	if not profile then
 		return false
@@ -1485,16 +1667,16 @@ end
 	@param player Player
 	@return boolean
 ]=]
-function Server.IsReady(self: Server, player: Player): boolean
+function Server.IsReady(self: Self, player: Player): boolean
 	return self:GetProfile(player) ~= nil
 end
 
-local function rollbackResult(key: string, profile: any): RollbackResult
+local function rollbackResult(key: string, profile: Profile<Table>): RollbackResult
 	local keyInfo = profile.KeyInfo
 	assert(keyInfo ~= nil, "historical profile is missing KeyInfo")
 	assert(typeof(keyInfo.Version) == "string", "historical profile KeyInfo is missing Version")
 	assert(typeof(keyInfo.UpdatedTime) == "number", "historical profile KeyInfo is missing UpdatedTime")
-	assert(typeof(profile.Data) == "table", "historical profile Data must be a table")
+	assert(Shared.asTable(profile.Data) ~= nil, "historical profile Data must be a table")
 	return {
 		key = key,
 		version = keyInfo.Version,
@@ -1503,7 +1685,7 @@ local function rollbackResult(key: string, profile: any): RollbackResult
 	}
 end
 
-function Server._selectRollback(self: Server, target: Target, selector: VersionSelector?): RollbackSelection?
+function Server._selectRollback(self: Self, target: Target, selector: VersionSelector?): RollbackSelection?
 	local key = self:GetKey(target)
 	local resolved: VersionSelector = selector or ({} :: VersionSelector)
 	assert(
@@ -1511,7 +1693,7 @@ function Server._selectRollback(self: Server, target: Target, selector: VersionS
 		"selector.version cannot be combined with before or stepsBack"
 	)
 
-	local profile: any = nil
+	local profile: Profile<Table>? = nil
 	if resolved.version ~= nil then
 		assert(typeof(resolved.version) == "string" and #resolved.version > 0, "selector.version must be non-empty")
 		profile = self._store:GetAsync(key, resolved.version)
@@ -1543,9 +1725,9 @@ function Server._selectRollback(self: Server, target: Target, selector: VersionS
 	return nil
 end
 
-function Server._endActiveSessionForKeyAsync(self: Server, key: string): boolean
+function Server._endActiveSessionForKeyAsync(self: Self, key: string): boolean
 	local activePlayer: Player? = nil
-	local activeProfile: Profile? = nil
+	local activeProfile: Profile<Table>? = nil
 	for player, profile in self._profiles do
 		if profile.Key == key or self:GetKey(player) == key then
 			activePlayer = player
@@ -1557,7 +1739,7 @@ function Server._endActiveSessionForKeyAsync(self: Server, key: string): boolean
 		return true
 	end
 
-	local released = Promise.fromEvent(self.ProfileReleased, function(player)
+	local released = Promise.fromEvent(self.ProfileReleased, function(player: unknown)
 		return player == activePlayer
 	end)
 	local saved = if activeProfile.OnAfterSave then Promise.fromEvent(activeProfile.OnAfterSave) else Promise.resolve()
@@ -1569,7 +1751,7 @@ function Server._endActiveSessionForKeyAsync(self: Server, key: string): boolean
 	return ok
 end
 
-function Server._applyRollbackAsync(self: Server, selection: RollbackSelection): RollbackResult
+function Server._applyRollbackAsync(self: Self, selection: RollbackSelection): RollbackResult
 	assert(self:_endActiveSessionForKeyAsync(selection.key), "active profile did not finish saving before rollback")
 	selection.profile:SetAsync()
 
@@ -1594,7 +1776,7 @@ end
 	@param selector VersionSelector?
 	@return RollbackResult?
 ]=]
-function Server.PreviewRollbackAsync(self: Server, target: Target, selector: VersionSelector?): RollbackResult?
+function Server.PreviewRollbackAsync(self: Self, target: Target, selector: VersionSelector?): RollbackResult?
 	local selection = self:_selectRollback(target, selector)
 	if selection == nil then
 		return nil
@@ -1613,7 +1795,7 @@ end
 	@param preview RollbackResult
 	@return RollbackResult
 ]=]
-function Server.ApplyRollbackAsync(self: Server, preview: RollbackResult): RollbackResult
+function Server.ApplyRollbackAsync(self: Self, preview: RollbackResult): RollbackResult
 	local selection = self._rollbackPreviews[preview]
 	assert(selection ~= nil, "preview is expired, already applied, or belongs to another Server")
 	local result = self:_applyRollbackAsync(selection)
@@ -1630,7 +1812,7 @@ end
 	@param selector VersionSelector?
 	@return RollbackResult?
 ]=]
-function Server.RollbackAsync(self: Server, target: Target, selector: VersionSelector?): RollbackResult?
+function Server.RollbackAsync(self: Self, target: Target, selector: VersionSelector?): RollbackResult?
 	local selection = self:_selectRollback(target, selector)
 	if selection == nil then
 		return nil
@@ -1646,7 +1828,7 @@ end
 	@param target Target
 	@return boolean
 ]=]
-function Server.WipeAsync(self: Server, target: Target): boolean
+function Server.WipeAsync(self: Self, target: Target): boolean
 	local key = self:GetKey(target)
 	assert(self:_endActiveSessionForKeyAsync(key), "active profile did not finish saving before wipe")
 	return self._store:RemoveAsync(key)
@@ -1657,7 +1839,7 @@ end
 	@within Server
 	@method Destroy
 ]=]
-function Server.Destroy(self: Server)
+function Server.Destroy(self: Self)
 	if self._isDestroyed then
 		return
 	end

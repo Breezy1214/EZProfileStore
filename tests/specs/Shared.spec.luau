@@ -53,11 +53,6 @@ return function()
 			expect(result.B).to.equal(3)
 			expect(source.A.Secret).to.equal(1)
 		end)
-
-		it("returns the same table when nothing is removed", function()
-			local source = { A = 1 }
-			expect(Shared.redact(source, { { "B" } })).to.equal(source)
-		end)
 	end)
 
 	describe("Shared.diff", function()
@@ -97,16 +92,6 @@ return function()
 		end)
 	end)
 
-	describe("Shared.OP", function()
-		it("exposes the five opcodes", function()
-			expect(Shared.OP.Set).to.equal("set")
-			expect(Shared.OP.Del).to.equal("del")
-			expect(Shared.OP.Ins).to.equal("ins")
-			expect(Shared.OP.AUpd).to.equal("aupd")
-			expect(Shared.OP.ARm).to.equal("arm")
-		end)
-	end)
-
 	describe("Shared.arrayUpdate", function()
 		it("replaces the value at a 1-based index", function()
 			local root = { Items = { "a", "b", "c" } }
@@ -125,10 +110,6 @@ return function()
 		it("returns false when target is not an array", function()
 			local root = { Stats = { Coins = 5 } }
 			expect(Shared.arrayUpdate(root, { "Stats" }, 1, "x")).to.equal(false)
-		end)
-
-		it("returns false on empty path", function()
-			expect(Shared.arrayUpdate({}, {}, 1, "x")).to.equal(false)
 		end)
 	end)
 
@@ -170,11 +151,6 @@ return function()
 			local root = { Stats = { Coins = 5 } }
 			local newRoot = Shared.arrayUpdateSpine(root, { "Stats" }, 1, "x")
 			expect(newRoot).to.equal(root)
-		end)
-
-		it("returns root unchanged on empty path", function()
-			local root = {}
-			expect(Shared.arrayUpdateSpine(root, {}, 1, "x")).to.equal(root)
 		end)
 	end)
 

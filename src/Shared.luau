@@ -6,6 +6,8 @@
 	Replication and immutable path helpers.
 ]=]
 
+local Path = require(script.Parent.Path)
+
 local Shared = {}
 
 Shared.REMOTE_FOLDER_NAME = "_EZProfileStore"
@@ -20,108 +22,117 @@ Shared.OP = table.freeze({
 	ARm = "arm",
 })
 
-export type KeyPath = string | { string }
+export type Table = { [unknown]: unknown }
 
-export type Update = { any }
+export type Update = { unknown }
 export type Batch = { Update }
 export type Snapshot = {
 	seq: number,
-	data: { [any]: any },
+	data: Table,
 }
 
-local EMPTY_PATH: { string } = table.freeze({}) :: any
-local EMPTY_SEEN: { [any]: boolean } = table.freeze({}) :: any
+local EMPTY_PATH: { string } = {}
+local EMPTY_TRAIL: { string | number } = {}
+local EMPTY_SEEN: { [unknown]: boolean } = {}
+table.freeze(EMPTY_PATH)
+table.freeze(EMPTY_TRAIL)
+table.freeze(EMPTY_SEEN)
 
 local PATH_CACHE_LIMIT = 256
 local _pathCache: { [string]: { string } } = {}
 local _pathCacheSize = 0
 
-function Shared.deepCopy(value: any): any
-	if typeof(value) ~= "table" then
+function Shared.asTable(value: unknown): Table?
+	return if typeof(value) == "table" then value :: Table else nil
+end
+
+function Shared.asArray(value: unknown): { unknown }?
+	return if typeof(value) == "table" then value :: { unknown } else nil
+end
+
+function Shared.deepCopy<T>(value: T): T
+	local source = Shared.asTable(value)
+	if source == nil then
 		return value
 	end
 
-	local result = {}
-	for key, child in value do
+	local result: Table = {}
+	for key, child in source do
 		result[Shared.deepCopy(key)] = Shared.deepCopy(child)
 	end
-	return result
+	return (result :: unknown) :: T
 end
 
-function Shared.deepEqual(left: any, right: any): boolean
+function Shared.deepEqual(left: unknown, right: unknown): boolean
 	if left == right then
 		return true
 	end
-	if typeof(left) ~= "table" or typeof(right) ~= "table" then
+	local leftTable, rightTable = Shared.asTable(left), Shared.asTable(right)
+	if leftTable == nil or rightTable == nil then
 		return false
 	end
 
-	for key, value in left do
-		if not Shared.deepEqual(value, right[key]) then
+	for key, value in leftTable do
+		if not Shared.deepEqual(value, rightTable[key]) then
 			return false
 		end
 	end
-	for key in right do
-		if left[key] == nil then
+	for key in rightTable do
+		if leftTable[key] == nil then
 			return false
 		end
 	end
 	return true
 end
 
-local SAVABLE_TYPES = table.freeze({
-	boolean = true,
-	number = true,
-	string = true,
-	table = true,
-	buffer = true,
-})
-
-local function describePath(path: { any }): string
+local function describePath(path: { string | number }): string
 	return if #path == 0 then "" else ` at "{table.concat(path, ".")}"`
 end
 
-local function findUnsavable(value: any, path: { any }, seen: { [any]: boolean }): string?
-	local valueType = typeof(value)
-	if not SAVABLE_TYPES[valueType] then
-		return `{valueType} cannot be saved{describePath(path)}`
-	end
-
-	if valueType == "number" then
+local function findUnsavable(value: unknown, path: { string | number }, seen: { [unknown]: boolean }): string?
+	if typeof(value) == "number" then
 		if value ~= value then
 			return `NaN cannot be saved{describePath(path)}`
 		elseif value == math.huge or value == -math.huge then
 			return `infinity cannot be saved{describePath(path)}`
 		end
 		return nil
-	elseif valueType == "string" then
+	elseif typeof(value) == "string" then
 		if utf8.len(value) == nil then
 			return `malformed UTF-8 string cannot be saved{describePath(path)}`
 		end
 		return nil
-	elseif valueType ~= "table" then
+	elseif typeof(value) == "boolean" or typeof(value) == "buffer" then
 		return nil
 	end
 
-	if seen[value] then
+	local tbl = Shared.asTable(value)
+	if tbl == nil then
+		return `{typeof(value)} cannot be saved{describePath(path)}`
+	end
+
+	if seen[tbl] then
 		return `cyclic table cannot be saved{describePath(path)}`
 	end
-	seen[value] = true
+	seen[tbl] = true
 
-	local arrayLength = #value
+	local arrayLength = #tbl
 	local hasStringKeys = false
 	local hasNumberKeys = false
-	for key, child in value do
+	for key, child in tbl do
+		local segment: string | number
 		if typeof(key) == "string" then
 			if utf8.len(key) == nil then
 				return `malformed UTF-8 key cannot be saved{describePath(path)}`
 			end
 			hasStringKeys = true
+			segment = key
 		elseif typeof(key) == "number" then
 			if key % 1 ~= 0 or key < 1 or key > arrayLength then
 				return `sparse or non-integer array key {key} cannot be saved{describePath(path)}`
 			end
 			hasNumberKeys = true
+			segment = key
 		else
 			return `{typeof(key)} key cannot be saved{describePath(path)}`
 		end
@@ -130,7 +141,7 @@ local function findUnsavable(value: any, path: { any }, seen: { [any]: boolean }
 			return `mixed array/dictionary table cannot be saved{describePath(path)}`
 		end
 
-		table.insert(path, key)
+		table.insert(path, segment)
 		local reason = findUnsavable(child, path, seen)
 		table.remove(path)
 		if reason then
@@ -138,28 +149,26 @@ local function findUnsavable(value: any, path: { any }, seen: { [any]: boolean }
 		end
 	end
 
-	seen[value] = nil
+	seen[tbl] = nil
 	return nil
 end
 
 -- Rejects values DataStores cannot encode or remotes cannot replicate faithfully.
-function Shared.validateValue(value: any): (boolean, string?)
+function Shared.validateValue(value: unknown): (boolean, string?)
 	-- Scalars never touch `path` or `seen`, so skip allocating them on hot write paths.
 	local isTable = typeof(value) == "table"
-	local reason = findUnsavable(value, if isTable then {} else EMPTY_PATH, if isTable then {} else EMPTY_SEEN)
+	local reason = findUnsavable(value, if isTable then {} else EMPTY_TRAIL, if isTable then {} else EMPTY_SEEN)
 	return reason == nil, reason
 end
 
--- Key path segments must be non-empty strings without ".".
-function Shared.isValidKey(key: any): boolean
-	return typeof(key) == "string" and key ~= "" and string.find(key, ".", 1, true) == nil
-end
+Shared.isValidKey = Path.isValidKey
 
-function Shared.isPathAddressable(value: any): boolean
-	if typeof(value) ~= "table" then
+function Shared.isPathAddressable(value: unknown): boolean
+	local tbl = Shared.asTable(value)
+	if tbl == nil then
 		return false
 	end
-	for key in value do
+	for key in tbl do
 		if not Shared.isValidKey(key) then
 			return false
 		end
@@ -188,111 +197,123 @@ function Shared.redact<T>(value: T, paths: { { string } }): T
 	return result
 end
 
-export type Change = { path: { string }, value: any }
+export type Change = { path: { string }, key: string, value: unknown }
 
-local function diffInto(old: any, new: any, prefix: { string }, out: { Change })
+local function diffInto(old: Table, new: Table, prefix: { string }, out: { Change }): unknown
+	local isRoot = #prefix == 0
 	for key, newChild in new do
 		local oldChild = old[key]
 		if oldChild == newChild then
 			continue
+		elseif isRoot and not Shared.isValidKey(key) then
+			return key
 		end
 
 		local path = table.clone(prefix)
-		table.insert(path, key)
-		if Shared.isPathAddressable(oldChild) and Shared.isPathAddressable(newChild) then
-			diffInto(oldChild, newChild, path, out)
+		table.insert(path, key :: string)
+		local oldTable, newTable = Shared.asTable(oldChild), Shared.asTable(newChild)
+		if oldTable and newTable and Shared.isPathAddressable(oldTable) and Shared.isPathAddressable(newTable) then
+			diffInto(oldTable, newTable, path, out)
 		elseif not Shared.deepEqual(oldChild, newChild) then
-			table.insert(out, { path = path, value = newChild })
+			table.insert(out, { path = path, key = table.concat(path, "."), value = newChild })
 		end
 	end
 
 	for key in old do
 		if new[key] == nil then
+			if isRoot and not Shared.isValidKey(key) then
+				return key
+			end
 			local path = table.clone(prefix)
-			table.insert(path, key)
-			table.insert(out, { path = path, value = nil })
+			table.insert(path, key :: string)
+			table.insert(out, { path = path, key = table.concat(path, "."), value = nil })
 		end
 	end
+	return nil
 end
 
--- Minimal key-path changes that turn `old` into `new`; both roots must be path-addressable.
-function Shared.diff(old: { [any]: any }, new: { [any]: any }): { Change }
+function Shared.diff(old: Table, new: Table): ({ Change }?, unknown)
 	local out: { Change } = {}
-	diffInto(old, new, {}, out)
-	return out
-end
-
-function Shared.resolveKeyPath(keyPath: KeyPath): { string }
-	if typeof(keyPath) == "string" then
-		if keyPath == "" then
-			return EMPTY_PATH
-		end
-
-		local cached = _pathCache[keyPath]
-		if cached then
-			return cached
-		end
-
-		local result = string.split(keyPath, ".")
-		if _pathCacheSize >= PATH_CACHE_LIMIT then
-			_pathCache = {}
-			_pathCacheSize = 0
-		end
-
-		_pathCache[keyPath] = result
-		_pathCacheSize += 1
-		return result
+	local invalidKey = diffInto(old, new, {}, out)
+	if invalidKey ~= nil then
+		return nil, invalidKey
 	end
-	return keyPath
+	return out, nil
 end
 
-function Shared.toPathString(keyPath: KeyPath): string
-	if typeof(keyPath) == "string" then
-		return keyPath
+function Shared.splitKey(keyPath: string): { string }
+	if keyPath == "" then
+		return EMPTY_PATH
 	end
-	return table.concat(keyPath, ".")
+
+	local cached = _pathCache[keyPath]
+	if cached then
+		return cached
+	end
+
+	local result = string.split(keyPath, ".")
+	if _pathCacheSize >= PATH_CACHE_LIMIT then
+		_pathCache = {}
+		_pathCacheSize = 0
+	end
+
+	_pathCache[keyPath] = result
+	_pathCacheSize += 1
+	return result
 end
 
-function Shared.readPath(data: any, path: { string }): any
-	local current: any = data
+function Shared.resolvePath(input: unknown): ({ string }, string)
+	if not Path.is(input) then
+		error(`EZProfileStore: expected a Path from Path.tree, got {typeof(input)}`, 3)
+	end
+	local path = input :: Path.AnyPath<unknown>
+	return path.__keys, path.__key
+end
+
+function Shared.readPath(data: unknown, path: { string }): unknown
+	local current = data
 	for _, key in path do
-		if typeof(current) ~= "table" then
+		local tbl = Shared.asTable(current)
+		if tbl == nil then
 			return nil
 		end
-		current = current[key]
+		current = tbl[key]
 	end
 	return current
 end
 
+function Shared.readArray(root: unknown, path: { string }): { unknown }?
+	return Shared.asArray(Shared.readPath(root, path))
+end
+
 -- Only non-nil set operations create missing parents.
-function Shared.writePath(root: any, path: { string }, value: any, isInsert: boolean): boolean
+function Shared.writePath(root: Table, path: { string }, value: unknown, isInsert: boolean): boolean
 	if #path == 0 then
 		return false
 	end
 
 	local createMissingParents = not isInsert and value ~= nil
-	local target: any = root
+	local target = root
 	for i = 1, #path - 1 do
-		if typeof(target) ~= "table" then
-			return false
-		end
-
 		local key = path[i]
-		if typeof(target[key]) ~= "table" then
+		local child = Shared.asTable(target[key])
+		if child == nil then
 			if not createMissingParents then
 				return false
 			end
-			target[key] = {}
+			child = {}
+			target[key] = child
 		end
-		target = target[key]
+		target = child :: Table
 	end
 
 	local finalKey = path[#path]
 	if isInsert then
-		if typeof(target[finalKey]) ~= "table" then
+		local array = Shared.asArray(target[finalKey])
+		if array == nil then
 			return false
 		end
-		table.insert(target[finalKey], value)
+		table.insert(array, value)
 		return true
 	end
 
@@ -303,175 +324,99 @@ function Shared.writePath(root: any, path: { string }, value: any, isInsert: boo
 	return true
 end
 
-local function navigateToTable(root: any, path: { string }): any?
-	local target: any = root
-	for _, key in path do
-		if typeof(target) ~= "table" then
-			return nil
-		end
-		target = target[key]
-	end
-	if typeof(target) ~= "table" then
-		return nil
-	end
-	return target
+local function isArrayIndex(arr: { unknown }, index: number): boolean
+	return index % 1 == 0 and index >= 1 and index <= #arr
 end
 
-function Shared.arrayUpdate(root: any, path: { string }, index: number, value: any): boolean
+function Shared.arrayUpdate(root: Table, path: { string }, index: number, value: unknown): boolean
 	if #path == 0 then
 		return false
 	end
-	local arr = navigateToTable(root, path)
-	if arr == nil then
-		return false
-	end
-	if index % 1 ~= 0 or index < 1 or index > #arr then
+	local arr = Shared.readArray(root, path)
+	if arr == nil or not isArrayIndex(arr, index) then
 		return false
 	end
 	arr[index] = value
 	return true
 end
 
-function Shared.arrayRemove(root: any, path: { string }, index: number): boolean
+function Shared.arrayRemove(root: Table, path: { string }, index: number): boolean
 	if #path == 0 then
 		return false
 	end
-	local arr = navigateToTable(root, path)
-	if arr == nil then
-		return false
-	end
-	if index % 1 ~= 0 or index < 1 or index > #arr then
+	local arr = Shared.readArray(root, path)
+	if arr == nil or not isArrayIndex(arr, index) then
 		return false
 	end
 	table.remove(arr, index)
 	return true
 end
 
--- Clones only the changed spine so unaffected Fusion dependencies keep identity.
-function Shared.writePathSpine<T>(root: T, path: { string }, value: any, isInsert: boolean): T
-	if #path == 0 then
-		return root
-	end
-
-	if isInsert or value == nil then
-		local existing: any = root
-		for i = 1, #path - 1 do
-			if typeof(existing) ~= "table" then
-				return root
-			end
-			existing = existing[path[i]]
-		end
-
-		if typeof(existing) ~= "table" then
-			return root
-		end
-
-		local finalKey = path[#path]
-		if isInsert then
-			if typeof(existing[finalKey]) ~= "table" then
-				return root
-			end
-		elseif existing[finalKey] == nil then
-			return root
-		end
-
-		local newRoot: any = table.clone(root :: any)
-		local target: any = newRoot
-		for i = 1, #path - 1 do
-			local key = path[i]
-			target[key] = table.clone(target[key])
-			target = target[key]
-		end
-
-		if isInsert then
-			local newArr = table.clone(target[finalKey])
-			table.insert(newArr, value)
-			target[finalKey] = newArr
-		else
-			target[finalKey] = nil
-		end
-
-		return newRoot :: T
-	end
-
-	local newRoot: any = if typeof(root) == "table" then table.clone(root :: any) else {}
-	local target: any = newRoot
-
+local function cloneSpine(root: unknown, path: { string }): (Table, Table)
+	local newRoot: Table = table.clone(Shared.asTable(root) or {})
+	local target = newRoot
 	for i = 1, #path - 1 do
 		local key = path[i]
-		local existing = target[key]
-		target[key] = if typeof(existing) == "table" then table.clone(existing) else {}
-		target = target[key]
+		local child: Table = table.clone(Shared.asTable(target[key]) or {})
+		target[key] = child
+		target = child
 	end
-
-	local finalKey = path[#path]
-	target[finalKey] = value
-
-	return newRoot :: T
+	return newRoot, target
 end
 
-function Shared.arrayUpdateSpine<T>(root: T, path: { string }, index: number, value: any): T
+function Shared.writePathSpine<T>(root: T, path: { string }, value: unknown, isInsert: boolean): T
 	if #path == 0 then
 		return root
 	end
 
-	local existing: any = root
-	for _, key in path do
-		if typeof(existing) ~= "table" then
+	local finalKey = path[#path]
+	if isInsert or value == nil then
+		local existing = Shared.readPath(root, path)
+		if if isInsert then Shared.asTable(existing) == nil else existing == nil then
 			return root
 		end
-		existing = existing[key]
 	end
-	if typeof(existing) ~= "table" or index < 1 or index > #existing then
+
+	local newRoot, target = cloneSpine(root, path)
+	if isInsert then
+		local newArr = table.clone(target[finalKey] :: { unknown })
+		table.insert(newArr, value)
+		target[finalKey] = newArr
+	else
+		target[finalKey] = value
+	end
+
+	return (newRoot :: unknown) :: T
+end
+
+local function arraySpine<T>(root: T, path: { string }, index: number, value: unknown, isRemove: boolean): T
+	if #path == 0 then
+		return root
+	end
+	local existing = Shared.readArray(root, path)
+	if existing == nil or not isArrayIndex(existing, index) then
 		return root
 	end
 
-	local newRoot: any = if typeof(root) == "table" then table.clone(root :: any) else {}
-	local target: any = newRoot
-	for i = 1, #path - 1 do
-		local key = path[i]
-		target[key] = table.clone(target[key])
-		target = target[key]
-	end
-
+	local newRoot, target = cloneSpine(root, path)
 	local finalKey = path[#path]
-	local newArr = table.clone(target[finalKey])
-	newArr[index] = value
+	local newArr = table.clone(existing)
+	if isRemove then
+		table.remove(newArr, index)
+	else
+		newArr[index] = value
+	end
 	target[finalKey] = newArr
 
-	return newRoot :: T
+	return (newRoot :: unknown) :: T
+end
+
+function Shared.arrayUpdateSpine<T>(root: T, path: { string }, index: number, value: unknown): T
+	return arraySpine(root, path, index, value, false)
 end
 
 function Shared.arrayRemoveSpine<T>(root: T, path: { string }, index: number): T
-	if #path == 0 then
-		return root
-	end
-
-	local existing: any = root
-	for _, key in path do
-		if typeof(existing) ~= "table" then
-			return root
-		end
-		existing = existing[key]
-	end
-	if typeof(existing) ~= "table" or index < 1 or index > #existing then
-		return root
-	end
-
-	local newRoot: any = if typeof(root) == "table" then table.clone(root :: any) else {}
-	local target: any = newRoot
-	for i = 1, #path - 1 do
-		local key = path[i]
-		target[key] = table.clone(target[key])
-		target = target[key]
-	end
-
-	local finalKey = path[#path]
-	local newArr = table.clone(target[finalKey])
-	table.remove(newArr, index)
-	target[finalKey] = newArr
-
-	return newRoot :: T
+	return arraySpine(root, path, index, nil, true)
 end
 
 return Shared
