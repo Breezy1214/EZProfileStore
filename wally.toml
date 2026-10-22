@@ -16,6 +16,7 @@ exclude = [
 	"dev.project.json",
 	"test.project.json",
 	"model.project.json",
+	"bundle",
 	"testez.yml",
 	"moonwave.toml",
 	"sourcemap.json",
